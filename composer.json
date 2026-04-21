@@ -1,0 +1,38 @@
+{
+  "name": "lexis/lexis-php",
+  "description": "Official PHP SDK for the Lexis search API (sync + search endpoints).",
+  "type": "library",
+  "license": "MIT",
+  "keywords": ["lexis", "search", "sdk", "full-text-search", "api-client"],
+  "homepage": "https://lexis.florentiu.me",
+  "support": {
+    "docs": "https://lexis.florentiu.me/docs",
+    "issues": "https://github.com/florentiu/lexis-php/issues",
+    "source": "https://github.com/florentiu/lexis-php"
+  },
+  "require": {
+    "php": "^7.4 || ^8.0",
+    "ext-curl": "*",
+    "ext-json": "*"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^9.6"
+  },
+  "autoload": {
+    "psr-4": {
+      "Lexis\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Lexis\\Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "test": "phpunit"
+  },
+  "config": {
+    "sort-packages": true
+  },
+  "minimum-stability": "stable"
+}
