@@ -21,7 +21,7 @@ use Lexis\Http\Response;
  *     // Managed cloud
  *     $lexis = new \Lexis\Client('lexis_live_xxx');
  *
- *     // Self-hosted / enterprise — point at your own dashboard
+ *     // Enterprise / enterprise — point at your own dashboard
  *     $lexis = new \Lexis\Client(
  *         'lexis_live_xxx',
  *         'https://search.my-company.internal'
@@ -49,6 +49,17 @@ final class Client
     public Sync $sync;
 
     /**
+     * Storefront-supplied session id forwarded on every request.
+     * Routed via the `X-Lexis-Session-Id` header so the engine can
+     * count distinct visitors in zero-results / CTR analytics. Set
+     * once on the client (typically right after construction) with
+     * {@see setSessionId()}; cleared with `setSessionId(null)`.
+     *
+     * @var string|null
+     */
+    private ?string $sessionId = null;
+
+    /**
      * Two call shapes:
      *
      *   1. Quick — pass the API key (and optionally the base URL) directly.
@@ -67,7 +78,7 @@ final class Client
      *                                      (Untyped in the signature because
      *                                      union types are PHP 8+ only.)
      * @param string|null   $baseUrl        Optional base URL for enterprise /
-     *                                      self-hosted installs (no trailing
+     *                                      enterprise installs (no trailing
      *                                      slash; `/api/v1` is appended per
      *                                      request). Ignored — and rejected —
      *                                      when $apiKeyOrConfig is a Config.
@@ -129,6 +140,183 @@ final class Client
     }
 
     /**
+     * URL parameter the engine reads back to attribute clicks. Single source
+     * of truth — both {@see withQid()} and the storefront's request handler
+     * read this constant rather than hard-coding "lexis_qid", so renaming it
+     * (engine-side) only takes one change here.
+     */
+    public const ATTRIBUTION_PARAM = 'lexis_qid';
+
+    /**
+     * Set (or clear) the storefront-supplied session id forwarded on every
+     * request as `X-Lexis-Session-Id`. Lets the engine count distinct
+     * visitors in zero-results / CTR analytics — without it the
+     * `affectedSessions` and `uniqueSessions` columns are blank.
+     *
+     * Call this once after instantiation, typically with the framework's
+     * native session id:
+     *
+     *     // PHP native
+     *     $lexis->setSessionId(session_id() ?: null);
+     *
+     *     // Symfony
+     *     $lexis->setSessionId($request->getSession()->getId());
+     *
+     *     // Laravel
+     *     $lexis->setSessionId($request->session()->getId());
+     *
+     * The value is opaque to the engine — pass anything stable across a
+     * single visitor's session. Never include PII; the id is hashed for
+     * counting, but you control what enters the hash.
+     *
+     * Pass `null` to stop forwarding.
+     */
+    public function setSessionId(?string $sessionId): void
+    {
+        $this->sessionId = $sessionId;
+    }
+
+    /**
+     * Currently configured session id, or `null` if none is set.
+     */
+    public function getSessionId(): ?string
+    {
+        return $this->sessionId;
+    }
+
+    /**
+     * Append the per-search `qid` to a result link as a query parameter so
+     * the storefront's landing-page request can echo it back to
+     * {@see recordClick()}. Idempotent — a URL that already has a
+     * `?lexis_qid=...` is overwritten so re-stamping during pagination
+     * doesn't accumulate duplicate params.
+     *
+     *     foreach ($result->hits as $i => $hit) {
+     *         $href = $lexis->withQid($hit->get('url'), $result->qid);
+     *         // render <a href="$href">...
+     *     }
+     *
+     * No-op when `$qid` is empty (talking to a pre-attribution engine, or
+     * `?log=false` was used on the search call) — the storefront link still
+     * works, attribution just doesn't fire.
+     *
+     * @param string $url Absolute or relative product URL.
+     * @param string $qid The {@see SearchResult::$qid} from the matching search.
+     */
+    public function withQid(string $url, string $qid): string
+    {
+        if ($qid === '' || $url === '') {
+            return $url;
+        }
+        $param = self::ATTRIBUTION_PARAM;
+        $separator = strpos($url, '?') === false ? '?' : '&';
+        // If the URL already carries `lexis_qid=...`, replace it in place
+        // rather than appending a second copy (some referrer chains can
+        // forward the original URL and we'd end up with two values).
+        $pattern = '/([?&])' . preg_quote($param, '/') . '=[^&]*/';
+        if (preg_match($pattern, $url) === 1) {
+            $replaced = preg_replace($pattern, '$1' . $param . '=' . urlencode($qid), $url);
+            return $replaced ?? $url;
+        }
+        return $url . $separator . $param . '=' . urlencode($qid);
+    }
+
+    /**
+     * Record a click against a previous search. Called by the storefront
+     * server when a request comes in carrying `?lexis_qid=...` — that
+     * proves the visit originated from a Lexis search result. Strictly
+     * server-side: there is intentionally no JavaScript counterpart so
+     * customers don't have to ship our analytics code to the browser.
+     *
+     *     // In your product-page controller:
+     *     $qid = $_GET[\Lexis\Client::ATTRIBUTION_PARAM] ?? null;
+     *     if ($qid) {
+     *         $lexis->recordClick(
+     *             'products',
+     *             (string) $qid,
+     *             $product->id,
+     *             position: $_GET['lexis_pos'] ?? null,
+     *             landingUrl: $_SERVER['REQUEST_URI'] ?? null,
+     *         );
+     *     }
+     *
+     * Best-effort: the call returns silently on success and throws the
+     * usual {@see LexisException} family on hard failure. Wrap the call
+     * in a try/catch if you don't want analytics noise to break the
+     * product page render.
+     *
+     * @param string      $index      Slug of the index the search ran against.
+     * @param string      $qid        The qid echoed back from the search response.
+     * @param string      $productId  Primary key of the clicked document.
+     * @param int|null    $position   1-based rank in the result list (optional).
+     * @param string|null $landingUrl Final landing URL for ops debugging (optional).
+     */
+    public function recordClick(
+        string $index,
+        string $qid,
+        string $productId,
+        ?int $position = null,
+        ?string $landingUrl = null
+    ): void {
+        $body = [
+            'index' => $index,
+            'qid' => $qid,
+            'product_id' => $productId,
+        ];
+        if ($position !== null) {
+            $body['position'] = $position;
+        }
+        if ($landingUrl !== null && $landingUrl !== '') {
+            $body['landing_url'] = $landingUrl;
+        }
+        $this->request('POST', '/api/v1/click', $body);
+    }
+
+    /**
+     * Pull the click-attribution rollup the engine builds in-memory from
+     * search × click events. Returns a typed view ready to render in the
+     * dashboard or a self-hosted admin page.
+     *
+     * Currently lives on the admin tier of the engine
+     * (`/v1/admin/orgs/:org_id/analytics/click-attribution`) — pass the
+     * org id you got from the dashboard / CLI. The session-style bearer
+     * (or an admin-scoped API key) is the same one the rest of the SDK uses.
+     *
+     * @param string   $orgId      Org id (the dashboard shows this on the org page).
+     * @param string|null $indexSlug Optional slug filter — narrow to one index.
+     * @param int|null $fromMs     Window start, ms-since-epoch. Defaults to now-90d.
+     * @param int|null $toMs       Window end, ms-since-epoch. Defaults to now.
+     * @param int|null $limit      Top-N rows in the response (default 50, max 200).
+     */
+    public function getClickAttribution(
+        string $orgId,
+        ?string $indexSlug = null,
+        ?int $fromMs = null,
+        ?int $toMs = null,
+        ?int $limit = null
+    ): ClickAttribution {
+        $query = [];
+        if ($indexSlug !== null && $indexSlug !== '') {
+            $query['index_slug'] = $indexSlug;
+        }
+        if ($fromMs !== null) {
+            $query['from_ms'] = $fromMs;
+        }
+        if ($toMs !== null) {
+            $query['to_ms'] = $toMs;
+        }
+        if ($limit !== null) {
+            $query['limit'] = $limit;
+        }
+        $path = '/v1/admin/orgs/' . rawurlencode($orgId) . '/analytics/click-attribution';
+        if (!empty($query)) {
+            $path .= '?' . http_build_query($query);
+        }
+        $data = $this->request('GET', $path, null);
+        return ClickAttribution::fromArray($data);
+    }
+
+    /**
      * Execute a request against the Lexis API. Shared between Client::search
      * and the Sync sub-client; applies retry, status-to-exception mapping,
      * and JSON decoding so every handler above stays trivial.
@@ -146,6 +334,13 @@ final class Client
             'Accept' => 'application/json',
             'User-Agent' => $this->config->userAgent,
         ];
+        // Forward the storefront-supplied session id (if set) on every
+        // request. The engine logs it on search and click events so
+        // analytics can count distinct visitors. Header-based wiring
+        // means handlers don't have to thread it through every call.
+        if ($this->sessionId !== null && $this->sessionId !== '') {
+            $headers['X-Lexis-Session-Id'] = $this->sessionId;
+        }
         $encodedBody = null;
         if ($body !== null) {
             $encodedBody = json_encode(

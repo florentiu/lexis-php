@@ -26,7 +26,7 @@ if (!is_string($apiKey) || $apiKey === '') {
     exit(1);
 }
 
-// LEXIS_BASE_URL is optional; unset = managed cloud, set = enterprise / self-hosted.
+// LEXIS_BASE_URL is optional; unset = managed cloud, set = enterprise deployment.
 $baseUrlEnv = getenv('LEXIS_BASE_URL');
 $baseUrl = is_string($baseUrlEnv) && $baseUrlEnv !== '' ? $baseUrlEnv : null;
 

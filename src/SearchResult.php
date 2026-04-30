@@ -55,6 +55,18 @@ final class SearchResult
     public ?string $suggestion;
 
     /**
+     * Per-search opaque id minted by the engine (`q_<8 base62>`). Round-trip it
+     * back to the engine as `?lexis_qid=...` on result links so the storefront's
+     * landing-page request can post a click attribution beacon via
+     * {@see Client::recordClick()}. Empty string when the engine response
+     * omitted the field — talking to a pre-click-attribution engine, or the
+     * caller passed `?log=false`.
+     *
+     * @readonly
+     */
+    public string $qid;
+
+    /**
      * @param array<int, SearchHit> $hits           Relevance-ordered results (page only).
      * @param int                   $total          Total matching documents across all pages.
      * @param int                   $limit          Page size used.
@@ -63,6 +75,7 @@ final class SearchResult
      * @param string                $query          Normalised query the engine actually ran.
      * @param array<int, string>    $expandedTerms  Stemmed/synonym-expanded terms.
      * @param string|null           $suggestion     Did-you-mean; null when none.
+     * @param string                $qid            Per-search opaque id; '' when absent.
      */
     public function __construct(
         array $hits,
@@ -72,7 +85,8 @@ final class SearchResult
         int $tookMs,
         string $query,
         array $expandedTerms,
-        ?string $suggestion
+        ?string $suggestion,
+        string $qid = ''
     ) {
         $this->hits = $hits;
         $this->total = $total;
@@ -82,6 +96,7 @@ final class SearchResult
         $this->query = $query;
         $this->expandedTerms = $expandedTerms;
         $this->suggestion = $suggestion;
+        $this->qid = $qid;
     }
 
     /**
@@ -103,6 +118,7 @@ final class SearchResult
         $expandedStrings = array_values(array_map('strval', $expanded));
 
         $suggestion = isset($raw['suggestion']) ? $raw['suggestion'] : null;
+        $qid = isset($raw['qid']) && is_string($raw['qid']) ? $raw['qid'] : '';
 
         return new self(
             $hits,
@@ -112,7 +128,8 @@ final class SearchResult
             (int) ($raw['took_ms'] ?? 0),
             (string) ($raw['query'] ?? ''),
             $expandedStrings,
-            is_string($suggestion) && $suggestion !== '' ? $suggestion : null
+            is_string($suggestion) && $suggestion !== '' ? $suggestion : null,
+            $qid
         );
     }
 }

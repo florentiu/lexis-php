@@ -1,6 +1,6 @@
 # Lexis PHP SDK
 
-Official PHP client for the [Lexis](https://lexis.florentiu.me) search API —
+Official PHP client for the [Lexis](https://lexis.software) search API —
 sync your catalog, query the index, done. Zero runtime dependencies beyond
 `ext-curl` + `ext-json`.
 
@@ -32,7 +32,7 @@ use Lexis\Client;
 // Managed cloud (default)
 $lexis = new Client(getenv('LEXIS_API_KEY'));
 
-// OR — self-hosted / enterprise install, point at your own dashboard URL:
+// OR — enterprise install, point at your own dashboard URL:
 // $lexis = new Client(getenv('LEXIS_API_KEY'), 'https://search.my-company.internal');
 
 // 1. Push your catalog
@@ -60,12 +60,12 @@ foreach ($result->hits as $hit) {
 }
 ```
 
-## Self-hosted / enterprise deployments
+## Enterprise / enterprise deployments
 
 For installs on your own infrastructure, pass the dashboard URL as the
 second argument — that's the only change needed. Auth header, request /
 response shapes, retries, error codes: all identical across cloud and
-self-hosted.
+enterprise.
 
 ```php
 use Lexis\Client;
@@ -177,7 +177,93 @@ $result->total;                    // total matches across all pages
 $result->tookMs;                   // server-side query time
 $result->expandedTerms;            // ["adidas", "nike"] — stemmed/synonym-expanded
 $result->suggestion;               // "adidași" when the engine has a did-you-mean
+$result->qid;                      // "q_a8f4kx2j" — per-search id; '' on older engines
 ```
+
+## Click attribution
+
+Click attribution measures which search results actually got clicked,
+so the engine can compute CTR, top-by-CTR, and zero-click rollups for
+the dashboard's `/analytics` page. **It's strictly server-side** — no
+JavaScript ships to the browser, you don't need to inject a tracking
+pixel, and the customer's storefront keeps full control of what's sent.
+
+The flow is three touch points wired through this SDK:
+
+```
+┌────────────┐  search()         ┌──────────────┐
+│ /search    │ ────────────────► │   Lexis      │
+│ controller │                   │   engine     │
+│            │ ◄──────────────── │              │
+└────────────┘  hits + qid       └──────────────┘
+       │
+       │ withQid($url, $qid)  ← stamps ?lexis_qid onto links
+       ▼
+   <a href="…?lexis_qid=q_a8f4kx2j">…</a>
+
+──── customer's browser navigates to a product page ────
+
+┌────────────┐  recordClick()    ┌──────────────┐
+│ /product   │ ────────────────► │   Lexis      │
+│ controller │                   │   engine     │
+└────────────┘                   └──────────────┘
+```
+
+### 1. Stamp `qid` onto result links
+
+```php
+$result = $lexis->search('products', 'adidasi');
+foreach ($result->hits as $i => $hit) {
+    $rawUrl = "https://shop.example.ro/p/{$hit->id}";
+    $href = $lexis->withQid($rawUrl, $result->qid)
+        . '&lexis_pos=' . ($i + 1);   // optional rank, lights up position-bias analytics
+    // …render <a href="$href">…</a>
+}
+```
+
+### 2. Record the click on the product page
+
+In your product-page controller, post a beacon when the request
+carries `?lexis_qid=…`. Best-effort: wrap in try/catch so analytics
+noise never breaks the page render.
+
+```php
+$qid = $_GET[\Lexis\Client::ATTRIBUTION_PARAM] ?? null;
+if (is_string($qid) && $qid !== '') {
+    try {
+        $lexis->recordClick(
+            'products',
+            $qid,
+            $product->id,
+            isset($_GET['lexis_pos']) ? (int) $_GET['lexis_pos'] : null,
+            $_SERVER['REQUEST_URI'] ?? null,
+        );
+    } catch (\Lexis\Exception\LexisException $e) {
+        error_log('lexis click telemetry: ' . $e->getMessage());
+    }
+}
+```
+
+### 3. Pull the rollup from your admin
+
+```php
+$rep = $lexis->getClickAttribution($orgId, 'products');
+
+$rep->kpi['clicks'];          // 1234
+$rep->kpi['searches'];        // 4500
+$rep->kpi['ctr'];             // 0.274 (clicks/searches)
+$rep->kpi['zeroClickCount'];  // 12
+
+foreach ($rep->topByCtr as $row) {
+    // ['query' => 'shoes', 'clicks' => 42, 'ctr' => 0.6, 'topProduct' => 'sku-A']
+}
+foreach ($rep->zeroClickQueries as $row) {
+    // ['query' => 'socks', 'searches' => 9, 'lastSeen' => '2026-04-30T10:00:00Z']
+}
+```
+
+A complete end-to-end script (search → result links → product page →
+rollup) lives at `examples/storefront-with-click-attribution.php`.
 
 ## Error handling
 
@@ -227,7 +313,7 @@ use Lexis\Config;
 // PHP 7.4-compatible (positional):
 $lexis = new Client(new Config(
     'lexis_live_...',            // apiKey
-    'https://lexis.florentiu.me', // baseUrl (default — change for self-hosted)
+    'https://lexis.software', // baseUrl (default — change for enterprise)
     30.0,                         // timeout (s)
     3,                            // maxRetries on 429/5xx/network; 0 disables
     0.5,                          // retryBaseDelay (s) — doubles each attempt

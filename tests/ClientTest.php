@@ -229,7 +229,7 @@ final class ClientTest extends TestCase
 
     public function testEnterpriseBaseUrlViaShortConstructor(): void
     {
-        // Self-hosted flow: pass baseUrl as the second constructor arg, no
+        // Enterprise flow: pass baseUrl as the second constructor arg, no
         // need to import Config at all. Every request must go to the custom
         // host — never to the default cloud URL.
         $client = new Client('lexis_live_xxx', 'https://search.acme.corp');
@@ -268,6 +268,248 @@ final class ClientTest extends TestCase
         new Client(
             new Config('k', 'https://a.example'),
             'https://b.example'
+        );
+    }
+
+    public function testSearchExposesQidWhenEnginePresentsIt(): void
+    {
+        // Engines on click-attribution stamp every response with `qid`;
+        // the SDK round-trips it as a typed field on SearchResult so the
+        // storefront can hand it to withQid()/recordClick() without
+        // touching raw arrays.
+        $this->transport->queue(200, [
+            'hits' => [],
+            'total' => 0,
+            'limit' => 20,
+            'offset' => 0,
+            'took_ms' => 1,
+            'query' => 'x',
+            'expanded_terms' => [],
+            'qid' => 'q_abc12345',
+        ]);
+
+        $result = $this->client->search('products', 'x');
+        $this->assertSame('q_abc12345', $result->qid);
+    }
+
+    public function testSearchQidIsEmptyWhenEngineOmitsIt(): void
+    {
+        // Older engines (or `?log=false`) won't carry qid. The field
+        // must still be populated as an empty string so consumers can
+        // skip click-attribution wiring with one cheap check rather
+        // than a null guard.
+        $this->transport->queue(200, [
+            'hits' => [], 'total' => 0, 'limit' => 20, 'offset' => 0,
+            'took_ms' => 1, 'query' => '', 'expanded_terms' => [],
+        ]);
+
+        $result = $this->client->search('products', 'x');
+        $this->assertSame('', $result->qid);
+    }
+
+    public function testWithQidAppendsParamToBareUrl(): void
+    {
+        $url = $this->client->withQid('https://shop.example/p/A', 'q_abc12345');
+        $this->assertSame('https://shop.example/p/A?lexis_qid=q_abc12345', $url);
+    }
+
+    public function testWithQidUsesAmpersandWhenQueryAlreadyPresent(): void
+    {
+        $url = $this->client->withQid('https://shop.example/p/A?ref=email', 'q_abc12345');
+        $this->assertSame(
+            'https://shop.example/p/A?ref=email&lexis_qid=q_abc12345',
+            $url
+        );
+    }
+
+    public function testWithQidReplacesExistingQid(): void
+    {
+        // Re-stamping during pagination shouldn't double-encode — replace
+        // the existing param in-place rather than appending a duplicate.
+        $url = $this->client->withQid(
+            'https://shop.example/p/A?lexis_qid=old_value&ref=email',
+            'q_new_one'
+        );
+        $this->assertSame(
+            'https://shop.example/p/A?lexis_qid=q_new_one&ref=email',
+            $url
+        );
+    }
+
+    public function testWithQidIsNoOpWhenQidEmpty(): void
+    {
+        // Pre-attribution engines / `?log=false` callers ship empty qids.
+        // The link must still work — leave the URL alone.
+        $url = $this->client->withQid('https://shop.example/p/A', '');
+        $this->assertSame('https://shop.example/p/A', $url);
+    }
+
+    public function testRecordClickPostsExpectedPayload(): void
+    {
+        $this->transport->queue(200, [
+            'id' => 'click-1',
+            'qid' => 'q_abc12345',
+            'product_id' => 'A',
+            'created_at_ms' => 1_700_000_000_000,
+        ]);
+
+        $this->client->recordClick(
+            'products',
+            'q_abc12345',
+            'A',
+            3,
+            'https://shop.example/p/A?lexis_qid=q_abc12345'
+        );
+
+        $call = $this->transport->calls[0];
+        $this->assertSame('POST', $call['method']);
+        $this->assertSame('https://lexis.test/api/v1/click', $call['url']);
+        $this->assertSame('Bearer lexis_test_key', $call['headers']['Authorization']);
+        $body = json_decode($call['body'], true);
+        $this->assertSame('products', $body['index']);
+        $this->assertSame('q_abc12345', $body['qid']);
+        $this->assertSame('A', $body['product_id']);
+        $this->assertSame(3, $body['position']);
+        $this->assertSame(
+            'https://shop.example/p/A?lexis_qid=q_abc12345',
+            $body['landing_url']
+        );
+    }
+
+    public function testRecordClickOmitsOptionalFieldsWhenNotProvided(): void
+    {
+        // Position + landing_url are optional context; the engine doesn't
+        // require them. The SDK shouldn't ship `null` either — that would
+        // fail the engine's serde validation. Drop the keys entirely.
+        $this->transport->queue(200, [
+            'id' => 'click-2',
+            'qid' => 'q_abc12345',
+            'product_id' => 'A',
+            'created_at_ms' => 1_700_000_000_000,
+        ]);
+
+        $this->client->recordClick('products', 'q_abc12345', 'A');
+
+        $body = json_decode($this->transport->calls[0]['body'], true);
+        $this->assertArrayNotHasKey('position', $body);
+        $this->assertArrayNotHasKey('landing_url', $body);
+    }
+
+    public function testGetClickAttributionDecodesResponse(): void
+    {
+        $this->transport->queue(200, [
+            'attribution_param' => 'lexis_qid',
+            'kpi' => [
+                'clicks' => 12,
+                'searches' => 30,
+                'ctr' => 0.4,
+                'zero_click_count' => 5,
+            ],
+            'top_by_ctr' => [
+                ['query' => 'shoes', 'clicks' => 9, 'ctr' => 0.75, 'top_product' => 'A'],
+                ['query' => 'boots', 'clicks' => 3, 'ctr' => 0.25, 'top_product' => null],
+            ],
+            'zero_click_queries' => [
+                ['query' => 'socks', 'searches' => 5, 'last_seen' => '2026-04-30T10:00:00Z'],
+            ],
+        ]);
+
+        $rep = $this->client->getClickAttribution(
+            'org_acme',
+            'products',
+            1_700_000_000_000,
+            1_700_086_400_000,
+            50
+        );
+
+        $this->assertSame('lexis_qid', $rep->attributionParam);
+        $this->assertSame(12, $rep->kpi['clicks']);
+        $this->assertSame(30, $rep->kpi['searches']);
+        $this->assertSame(0.4, $rep->kpi['ctr']);
+        $this->assertSame(5, $rep->kpi['zeroClickCount']);
+        $this->assertCount(2, $rep->topByCtr);
+        $this->assertSame('shoes', $rep->topByCtr[0]['query']);
+        $this->assertSame('A', $rep->topByCtr[0]['topProduct']);
+        $this->assertNull($rep->topByCtr[1]['topProduct']);
+        $this->assertCount(1, $rep->zeroClickQueries);
+        $this->assertSame('socks', $rep->zeroClickQueries[0]['query']);
+
+        $call = $this->transport->calls[0];
+        $this->assertSame('GET', $call['method']);
+        $this->assertStringContainsString(
+            '/v1/admin/orgs/org_acme/analytics/click-attribution',
+            $call['url']
+        );
+        $this->assertStringContainsString('index_slug=products', $call['url']);
+        $this->assertStringContainsString('from_ms=1700000000000', $call['url']);
+        $this->assertStringContainsString('to_ms=1700086400000', $call['url']);
+        $this->assertStringContainsString('limit=50', $call['url']);
+    }
+
+    public function testSessionIdForwardedAsHeader(): void
+    {
+        // Setting the session id should forward it on every subsequent
+        // request via `X-Lexis-Session-Id`. Engine uses that to count
+        // distinct visitors in zero-results / CTR analytics.
+        $this->client->setSessionId('sess_abc123');
+
+        $this->transport->queue(200, [
+            'hits' => [], 'total' => 0, 'limit' => 20, 'offset' => 0,
+            'took_ms' => 1, 'query' => '', 'expanded_terms' => [],
+        ]);
+        $this->client->search('products', 'x');
+
+        $headers = $this->transport->calls[0]['headers'];
+        $this->assertSame('sess_abc123', $headers['X-Lexis-Session-Id']);
+    }
+
+    public function testSessionIdAbsentByDefault(): void
+    {
+        // Without an explicit `setSessionId`, the header should NOT be
+        // forwarded — guarantees that integrators who don't opt in
+        // never accidentally leak whatever string `$this->sessionId`
+        // happens to default to.
+        $this->transport->queue(200, [
+            'hits' => [], 'total' => 0, 'limit' => 20, 'offset' => 0,
+            'took_ms' => 1, 'query' => '', 'expanded_terms' => [],
+        ]);
+        $this->client->search('products', 'x');
+
+        $headers = $this->transport->calls[0]['headers'];
+        $this->assertArrayNotHasKey('X-Lexis-Session-Id', $headers);
+    }
+
+    public function testSessionIdClearable(): void
+    {
+        $this->client->setSessionId('sess_abc123');
+        $this->assertSame('sess_abc123', $this->client->getSessionId());
+        $this->client->setSessionId(null);
+        $this->assertNull($this->client->getSessionId());
+
+        $this->transport->queue(200, [
+            'hits' => [], 'total' => 0, 'limit' => 20, 'offset' => 0,
+            'took_ms' => 1, 'query' => '', 'expanded_terms' => [],
+        ]);
+        $this->client->search('products', 'x');
+        $headers = $this->transport->calls[0]['headers'];
+        $this->assertArrayNotHasKey('X-Lexis-Session-Id', $headers);
+    }
+
+    public function testGetClickAttributionWithoutFiltersOmitsQueryString(): void
+    {
+        $this->transport->queue(200, [
+            'attribution_param' => 'lexis_qid',
+            'kpi' => ['clicks' => 0, 'searches' => 0, 'ctr' => 0.0, 'zero_click_count' => 0],
+            'top_by_ctr' => [],
+            'zero_click_queries' => [],
+        ]);
+
+        $this->client->getClickAttribution('org_acme');
+
+        $url = $this->transport->calls[0]['url'];
+        $this->assertSame(
+            'https://lexis.test/v1/admin/orgs/org_acme/analytics/click-attribution',
+            $url
         );
     }
 }

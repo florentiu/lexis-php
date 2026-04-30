@@ -4,9 +4,9 @@
   "type": "library",
   "license": "MIT",
   "keywords": ["lexis", "search", "sdk", "full-text-search", "api-client"],
-  "homepage": "https://lexis.florentiu.me",
+  "homepage": "https://lexis.software",
   "support": {
-    "docs": "https://lexis.florentiu.me/docs",
+    "docs": "https://lexis.software/docs",
     "issues": "https://github.com/florentiu/lexis-php/issues",
     "source": "https://github.com/florentiu/lexis-php"
   },

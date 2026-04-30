@@ -10,7 +10,7 @@ use Lexis\Http\Transport;
 /**
  * Immutable client configuration. Instantiate once and pass to {@see Client}.
  *
- * Defaults target the managed cloud (`https://lexis.florentiu.me`). Self-hosted
+ * Defaults target the managed cloud (`https://lexis.software`). Enterprise
  * deployments override baseUrl to point at their dashboard's hostname — the
  * API contract is identical across editions.
  *
@@ -20,7 +20,7 @@ use Lexis\Http\Transport;
  */
 final class Config
 {
-    public const DEFAULT_BASE_URL = 'https://lexis.florentiu.me';
+    public const DEFAULT_BASE_URL = 'https://lexis.software';
     public const DEFAULT_USER_AGENT = 'lexis-php/0.1.0';
 
     /** @readonly */
