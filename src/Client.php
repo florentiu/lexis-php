@@ -111,18 +111,38 @@ final class Client
     /**
      * Full-text search against a committed index.
      *
-     * @param string                     $index   Slug of the index to query.
-     * @param string                     $query   User query; up to 500 chars.
-     * @param int|null                   $limit   1–100, default 20.
-     * @param int|null                   $offset  0-based pagination, default 0.
-     * @param array<string, mixed>|null  $filters Logged but not yet applied in the engine.
+     * Supports two pagination styles:
+     *
+     *   * **Shallow** — pass `$offset` (0, 20, 40, ...). Cheap up to a few
+     *     hundred rows; the engine still has to walk every skipped row.
+     *   * **Deep** — pass `$searchAfter` with the previous page's
+     *     {@see SearchResult::$nextCursor}. O(page) regardless of depth;
+     *     `$offset` is ignored when a cursor is set.
+     *
+     * Use deep pagination past ~1k results, or for any "walk the whole
+     * catalog" loop:
+     *
+     *     $cursor = null;
+     *     do {
+     *         $r = $lexis->search('products', '*', 100, 0, null, $cursor);
+     *         foreach ($r->hits as $h) { ... }
+     *         $cursor = $r->nextCursor;
+     *     } while ($cursor !== null);
+     *
+     * @param string                     $index       Slug of the index to query.
+     * @param string                     $query       User query; up to 500 chars.
+     * @param int|null                   $limit       1–100, default 20.
+     * @param int|null                   $offset      0-based pagination; ignored when `$searchAfter` is set.
+     * @param array<string, mixed>|null  $filters     Logged but not yet applied in the engine.
+     * @param string|null                $searchAfter `search_after` cursor; consume {@see SearchResult::$nextCursor}.
      */
     public function search(
         string $index,
         string $query,
         ?int $limit = null,
         ?int $offset = null,
-        ?array $filters = null
+        ?array $filters = null,
+        ?string $searchAfter = null
     ): SearchResult {
         $body = ['index' => $index, 'q' => $query];
         if ($limit !== null) {
@@ -133,6 +153,12 @@ final class Client
         }
         if ($filters !== null) {
             $body['filters'] = $filters;
+        }
+        if ($searchAfter !== null && $searchAfter !== '') {
+            // Engine ignores `offset` when `search_after` is set; we
+            // still forward both if the caller passed them so server
+            // logs reflect the caller's intent.
+            $body['search_after'] = $searchAfter;
         }
 
         $data = $this->request('POST', '/api/v1/search', $body);

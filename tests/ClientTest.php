@@ -44,35 +44,62 @@ final class ClientTest extends TestCase
 
     public function testSearchReturnsTypedResult(): void
     {
+        // Wire shape mirrors `lexis_core::SearchResponse` exactly:
+        // per-hit `id`/`score`/`payload` (no `_pk`/`_score` prefixes),
+        // top-level `count_estimate`/`effective_query`, and `took_ms`
+        // nested under `diagnostics`. Anything else is the SDK's
+        // doing — not the engine's.
         $this->transport->queue(200, [
             'hits' => [
-                ['_id' => 'sku-1', '_pk' => 'sku-1', '_score' => 4.2, 'title' => 'Nike Air', 'price' => 349],
-                ['_id' => 'sku-2', '_pk' => 'sku-2', '_score' => 3.9, 'title' => 'Puma RS',  'price' => 299],
+                [
+                    'id' => 'sku-1',
+                    'score' => 4.2,
+                    'payload' => ['title' => 'Nike Air', 'price' => 349],
+                ],
+                [
+                    'id' => 'sku-2',
+                    'score' => 3.9,
+                    'payload' => ['title' => 'Puma RS', 'price' => 299],
+                ],
             ],
-            'total' => 2,
-            'limit' => 20,
-            'offset' => 0,
-            'took_ms' => 12,
-            'query' => 'adidași',
-            'expanded_terms' => ['adidas'],
+            'count_estimate' => 5000,
+            'effective_query' => 'adidași',
+            'auto_corrected' => false,
+            'qid' => 'q_abc12345',
+            'diagnostics' => [
+                'took_ms' => 12,
+                'primary_hits' => 5000,
+                'rerank_ms' => 3,
+                'fallback_ms' => 0,
+            ],
         ]);
 
         $result = $this->client->search('products', 'adidași');
 
-        $this->assertSame(2, $result->total);
+        $this->assertSame(5000, $result->total);
         $this->assertSame(12, $result->tookMs);
+        $this->assertSame('adidași', $result->query);
+        $this->assertFalse($result->autoCorrected);
+        $this->assertSame('q_abc12345', $result->qid);
         $this->assertCount(2, $result->hits);
         $this->assertSame('sku-1', $result->hits[0]->id);
         $this->assertSame(4.2, $result->hits[0]->score);
         $this->assertSame('Nike Air', $result->hits[0]->get('title'));
-        $this->assertArrayNotHasKey('_id', $result->hits[0]->document);
+        // The synthetic engine fields (`id`/`score`/`cursor`) live on the
+        // hit object — `document` only contains the original payload.
+        $this->assertArrayNotHasKey('id', $result->hits[0]->document);
+        $this->assertArrayNotHasKey('score', $result->hits[0]->document);
     }
 
     public function testSearchSendsBearerToken(): void
     {
         $this->transport->queue(200, [
-            'hits' => [], 'total' => 0, 'limit' => 20, 'offset' => 0,
-            'took_ms' => 1, 'query' => '', 'expanded_terms' => [],
+            'hits' => [],
+            'count_estimate' => 0,
+            'effective_query' => '',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
         ]);
         $this->client->search('products', 'x');
 
@@ -164,8 +191,12 @@ final class ClientTest extends TestCase
     {
         $this->transport->queue(429, ['error' => 'slow down'], ['retry-after' => '0']);
         $this->transport->queue(200, [
-            'hits' => [], 'total' => 0, 'limit' => 20, 'offset' => 0,
-            'took_ms' => 1, 'query' => '', 'expanded_terms' => [],
+            'hits' => [],
+            'count_estimate' => 0,
+            'effective_query' => '',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
         ]);
 
         $result = $this->client->search('products', 'x');
@@ -240,8 +271,12 @@ final class ClientTest extends TestCase
         // exercises the "custom Config" constructor path.
         $fake = new FakeTransport();
         $fake->queue(200, [
-            'hits' => [], 'total' => 0, 'limit' => 20, 'offset' => 0,
-            'took_ms' => 1, 'query' => '', 'expanded_terms' => [],
+            'hits' => [],
+            'count_estimate' => 0,
+            'effective_query' => '',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
         ]);
         $enterprise = new Client(new Config(
             'lexis_live_xxx',
@@ -279,13 +314,11 @@ final class ClientTest extends TestCase
         // touching raw arrays.
         $this->transport->queue(200, [
             'hits' => [],
-            'total' => 0,
-            'limit' => 20,
-            'offset' => 0,
-            'took_ms' => 1,
-            'query' => 'x',
-            'expanded_terms' => [],
+            'count_estimate' => 0,
+            'effective_query' => 'x',
+            'auto_corrected' => false,
             'qid' => 'q_abc12345',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
         ]);
 
         $result = $this->client->search('products', 'x');
@@ -299,8 +332,12 @@ final class ClientTest extends TestCase
         // skip click-attribution wiring with one cheap check rather
         // than a null guard.
         $this->transport->queue(200, [
-            'hits' => [], 'total' => 0, 'limit' => 20, 'offset' => 0,
-            'took_ms' => 1, 'query' => '', 'expanded_terms' => [],
+            'hits' => [],
+            'count_estimate' => 0,
+            'effective_query' => '',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
         ]);
 
         $result = $this->client->search('products', 'x');
@@ -454,8 +491,12 @@ final class ClientTest extends TestCase
         $this->client->setSessionId('sess_abc123');
 
         $this->transport->queue(200, [
-            'hits' => [], 'total' => 0, 'limit' => 20, 'offset' => 0,
-            'took_ms' => 1, 'query' => '', 'expanded_terms' => [],
+            'hits' => [],
+            'count_estimate' => 0,
+            'effective_query' => '',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
         ]);
         $this->client->search('products', 'x');
 
@@ -470,8 +511,12 @@ final class ClientTest extends TestCase
         // never accidentally leak whatever string `$this->sessionId`
         // happens to default to.
         $this->transport->queue(200, [
-            'hits' => [], 'total' => 0, 'limit' => 20, 'offset' => 0,
-            'took_ms' => 1, 'query' => '', 'expanded_terms' => [],
+            'hits' => [],
+            'count_estimate' => 0,
+            'effective_query' => '',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
         ]);
         $this->client->search('products', 'x');
 
@@ -487,12 +532,110 @@ final class ClientTest extends TestCase
         $this->assertNull($this->client->getSessionId());
 
         $this->transport->queue(200, [
-            'hits' => [], 'total' => 0, 'limit' => 20, 'offset' => 0,
-            'took_ms' => 1, 'query' => '', 'expanded_terms' => [],
+            'hits' => [],
+            'count_estimate' => 0,
+            'effective_query' => '',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
         ]);
         $this->client->search('products', 'x');
         $headers = $this->transport->calls[0]['headers'];
         $this->assertArrayNotHasKey('X-Lexis-Session-Id', $headers);
+    }
+
+    public function testSearchAfterCursorIsForwardedInBody(): void
+    {
+        // Deep pagination: when `$searchAfter` is set, the SDK must
+        // forward it as `search_after` in the JSON body so the engine
+        // can resume from the cursor instead of walking from offset 0.
+        $this->transport->queue(200, [
+            'hits' => [],
+            'count_estimate' => 0,
+            'effective_query' => '*',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
+        ]);
+
+        $cursor = 'eyJvZmZzZXQiOjksImxhc3RfaWQiOiIxMDQ4MCJ9';
+        $this->client->search('products', '*', 100, 0, null, $cursor);
+
+        $body = json_decode($this->transport->calls[0]['body'], true);
+        $this->assertSame($cursor, $body['search_after']);
+    }
+
+    public function testNextCursorMirrorsLastHitsCursor(): void
+    {
+        // The convenience `nextCursor` field on `SearchResult` lets
+        // callers paginate without inspecting per-hit cursors. It
+        // equals the `cursor` field of the last hit in the page.
+        $cursor = 'eyJvZmZzZXQiOjksImxhc3RfaWQiOiIxMDQ4MCJ9';
+        $this->transport->queue(200, [
+            'hits' => [
+                ['id' => 'sku-1', 'score' => 4.2, 'payload' => []],
+                ['id' => 'sku-2', 'score' => 3.9, 'payload' => [], 'cursor' => $cursor],
+            ],
+            'count_estimate' => 5000,
+            'effective_query' => '*',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 5000],
+        ]);
+
+        $result = $this->client->search('products', '*');
+
+        $this->assertSame($cursor, $result->nextCursor);
+        $this->assertSame($cursor, $result->hits[1]->cursor);
+        // First hit isn't a resumable boundary — engine omitted its
+        // cursor, so the SDK exposes null there.
+        $this->assertNull($result->hits[0]->cursor);
+    }
+
+    public function testNextCursorIsNullOnLastPage(): void
+    {
+        // Last page: engine omits the cursor on the final hit because
+        // there's nothing to resume. SDK surfaces `nextCursor = null`
+        // as the natural "end of stream" signal for `while ($cursor)`
+        // loops.
+        $this->transport->queue(200, [
+            'hits' => [
+                ['id' => 'sku-99', 'score' => 1.1, 'payload' => []],
+            ],
+            'count_estimate' => 100,
+            'effective_query' => '*',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 100],
+        ]);
+
+        $result = $this->client->search('products', '*');
+        $this->assertNull($result->nextCursor);
+    }
+
+    public function testAutoCorrectedFlagSurfaces(): void
+    {
+        // When the engine retries with a corrected query, it sets
+        // `auto_corrected: true` and replaces `effective_query`. The
+        // SDK exposes both so the storefront can render
+        // "Searched for X instead of Y".
+        $this->transport->queue(200, [
+            'hits' => [
+                ['id' => 'sku-1', 'score' => 4.2, 'payload' => ['title' => 'Adidași']],
+            ],
+            'count_estimate' => 1,
+            'effective_query' => 'adidași',
+            'suggestion' => 'adidași',
+            'auto_corrected' => true,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 5, 'primary_hits' => 1],
+        ]);
+
+        $result = $this->client->search('products', 'adidasi');
+
+        $this->assertTrue($result->autoCorrected);
+        $this->assertSame('adidași', $result->query);
+        $this->assertSame('adidași', $result->suggestion);
     }
 
     public function testGetClickAttributionWithoutFiltersOmitsQueryString(): void

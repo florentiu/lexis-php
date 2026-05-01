@@ -5,10 +5,25 @@ declare(strict_types=1);
 namespace Lexis;
 
 /**
- * One result row from /search. The server prefixes three synthetic fields on
- * every hit — `_id`, `_pk`, `_score` — and mixes in every document field the
- * caller originally pushed. We lift the synthetic ones to typed accessors
- * and keep the rest available raw.
+ * One result row from /search.
+ *
+ * Wire shape emitted by the engine (see `lexis_core::SearchHit`):
+ *
+ *     {
+ *       "id": "sku-1",
+ *       "score": 4.2,
+ *       "payload": { "title": "Adidași Nike Air", "price": 349 },
+ *       "cursor": "eyJvZmZzZXQiOjksImxhc3RfaWQiOiIxMDQ4MCJ9"
+ *     }
+ *
+ *   * `id` is the document's primary key as a string (regardless of whether
+ *     the field was numeric or string in the source — the engine canonicalizes).
+ *   * `score` is BM25 (or the RRF-fused score on hybrid runs).
+ *   * `payload` is everything the caller originally pushed; we expose it as
+ *     `$hit->document` and as a typed accessor `$hit->get('field')`.
+ *   * `cursor` is an opaque base64 token used for `search_after` deep
+ *     pagination — only present on hits where pagination can resume from
+ *     this row. The last row of the last page has no cursor.
  */
 final class SearchHit
 {
@@ -22,27 +37,32 @@ final class SearchHit
     public string $id;
 
     /** @readonly */
-    public string $primaryKey;
-
-    /** @readonly */
     public float $score;
 
     /**
-     * @param array<string, mixed> $raw The full JSON object for this hit,
-     *                                   including `_id`, `_pk`, `_score`.
+     * Opaque `search_after` cursor, or `null` when this hit isn't a
+     * resumable boundary (the engine omits the field on the final
+     * hit of the final page). The convenience accessor for the
+     * "next page" cursor is {@see SearchResult::$nextCursor} — most
+     * code shouldn't read this per-hit.
+     *
+     * @readonly
+     */
+    public ?string $cursor;
+
+    /**
+     * @param array<string, mixed> $raw The full JSON object for this hit.
+     *                                   Expected keys: `id`, `score`,
+     *                                   `payload`, optional `cursor`.
      */
     public function __construct(array $raw)
     {
-        $this->id = (string) ($raw['_id'] ?? '');
-        $this->primaryKey = (string) ($raw['_pk'] ?? $this->id);
-        $this->score = (float) ($raw['_score'] ?? 0);
-
-        // Strip the synthetic fields so $document holds only what the caller
-        // actually pushed. Keeps downstream serialisation (e.g. twig, JSON
-        // response) free of Lexis internals.
-        $doc = $raw;
-        unset($doc['_id'], $doc['_pk'], $doc['_score']);
-        $this->document = $doc;
+        $this->id = (string) ($raw['id'] ?? '');
+        $this->score = (float) ($raw['score'] ?? 0);
+        $payload = $raw['payload'] ?? [];
+        $this->document = is_array($payload) ? $payload : [];
+        $cursor = $raw['cursor'] ?? null;
+        $this->cursor = is_string($cursor) && $cursor !== '' ? $cursor : null;
     }
 
     /**
