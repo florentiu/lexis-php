@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.1.3 — document filtering
+
+The `filters` parameter on `Client::search()` has been functional
+end-to-end since v0.1.0 (the engine implements `tag_eq`, `tag_in`, and
+`numeric_range` server-side), but the PHPDoc and README still claimed
+the field was "logged but not yet applied" — a fossil from the
+PHP/Redis era of Lexis. This release fixes the docs only; no
+behavioral changes, no new code, no breaking changes:
+
+  * **PHPDoc on `Client::search()`** — describes all three filter
+    operator shapes (`tag_eq`, `tag_in`, `numeric_range`), shows a
+    multi-clause AND example, and notes the index-side prerequisite
+    (fields must be declared as `tagFields` / `numericFields`).
+  * **`@param` typed as `list<array<string, mixed>>|null`** — was
+    `array<string, mixed>|null`, which suggested an associative array
+    instead of a list of clause objects.
+  * **Docs site** — new "Filtering" section on
+    `lexis.software/docs/sdk/php` (RO + EN) between the auto-correct
+    section and the deep-pagination loop, with the same three-operator
+    walkthrough plus a pointer to the Search Logs detail sheet for
+    debugging.
+
+Existing v0.1.2 callers that already passed filter clauses will keep
+working without changes — this release is purely a docs
+correctness fix.
+
 ## v0.1.2 — wire-format alignment + deep pagination
 
 **BREAKING.** Aligns the SDK with the engine's actual `/api/v1/search`

@@ -129,11 +129,38 @@ final class Client
      *         $cursor = $r->nextCursor;
      *     } while ($cursor !== null);
      *
+     * Filters narrow the candidate set BEFORE ranking — they're applied
+     * server-side against the engine's tag and numeric indexes (configured
+     * at index creation as `tag:` / `numeric:` mappings). Three operator
+     * shapes are supported, identifiable by `op`:
+     *
+     *     // 1) Exact tag match — useful for brand, category, etc.
+     *     ['op' => 'tag_eq', 'field' => 'brand', 'value' => 'Nike']
+     *
+     *     // 2) Any-of tag match — multiple acceptable values for one field.
+     *     ['op' => 'tag_in', 'field' => 'category', 'values' => ['boots', 'sneakers']]
+     *
+     *     // 3) Half-open numeric range — either bound may be omitted.
+     *     ['op' => 'numeric_range', 'field' => 'price', 'min' => 100, 'max' => 500]
+     *
+     * Multiple clauses combine with AND (every clause must match). Pass them
+     * as a list under a single `filters` argument:
+     *
+     *     $r = $lexis->search('products', 'iarnă', 20, 0, [
+     *         ['op' => 'tag_eq', 'field' => 'brand', 'value' => 'Timberland'],
+     *         ['op' => 'numeric_range', 'field' => 'price', 'min' => 200, 'max' => 600],
+     *     ]);
+     *
+     * Unknown fields in a filter — fields the index wasn't configured to
+     * tag/index numerically — return a 400 from the engine. Make sure the
+     * index settings list those fields under `tagFields` /
+     * `numericFields` before sending filters that reference them.
+     *
      * @param string                     $index       Slug of the index to query.
      * @param string                     $query       User query; up to 500 chars.
      * @param int|null                   $limit       1–100, default 20.
      * @param int|null                   $offset      0-based pagination; ignored when `$searchAfter` is set.
-     * @param array<string, mixed>|null  $filters     Logged but not yet applied in the engine.
+     * @param list<array<string, mixed>>|null $filters Filter clauses combined with AND. See above for the operator shapes.
      * @param string|null                $searchAfter `search_after` cursor; consume {@see SearchResult::$nextCursor}.
      */
     public function search(
