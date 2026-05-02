@@ -265,6 +265,219 @@ foreach ($rep->zeroClickQueries as $row) {
 A complete end-to-end script (search → result links → product page →
 rollup) lives at `examples/storefront-with-click-attribution.php`.
 
+## Page-view tracking
+
+Click attribution answers "what does a user do **after** they search".
+Page-view tracking answers the complementary question: "**how does**
+the user arrive here?". Every hit on a product / category /
+search-results / home page records a generic event regardless of
+whether the visitor came from a Lexis search, an internal category,
+an external source (Google, Facebook, email), or a direct bookmark.
+
+What you can pivot on later in the dashboard at
+`/c/<connection>/analytics/journeys`:
+
+- **Per-product entry funnel** — for product X, what % of visits
+  came from search vs category vs external
+- **Top referring domains** — which external sites drive the most
+  traffic
+- **Search-to-view ratio** — how many searches convert into a
+  visit on the result page
+- **Source breakdown** — traffic distribution by source over time
+
+### One call per page template
+
+```php
+$referrer = $_SERVER['HTTP_REFERER'] ?? null;
+
+$lexis->recordView(
+    pageType: 'product',                          // search/product/category/home/other
+    source: \Lexis\Client::detectSource(          // auto-classify the referrer
+        $referrer,
+        $_SERVER['HTTP_HOST'] ?? null,
+    ),
+    productId: $product->id,                      // primary key on product pages
+    referrer: $referrer,                          // host extracted on SDK; full URL never leaves
+    landingUrl: $_SERVER['REQUEST_URI'] ?? null,  // strip query params before passing
+    qid: $_GET[\Lexis\Client::ATTRIBUTION_PARAM] ?? null,  // forward the qid from a search
+);
+```
+
+### Per page type
+
+```php
+// PRODUCT page
+$lexis->recordView(
+    pageType: 'product',
+    source: \Lexis\Client::detectSource($referrer, $host),
+    productId: $product->id,
+    referrer: $referrer,
+    landingUrl: $_SERVER['REQUEST_URI'] ?? null,
+    qid: $_GET[\Lexis\Client::ATTRIBUTION_PARAM] ?? null,
+);
+
+// CATEGORY page
+$lexis->recordView(
+    pageType: 'category',
+    source: \Lexis\Client::detectSource($referrer, $host),
+    categorySlug: $category->slug,
+    referrer: $referrer,
+    landingUrl: $_SERVER['REQUEST_URI'] ?? null,
+);
+
+// SEARCH-RESULTS page (rendered server-side after Client::search())
+$lexis->recordView(
+    pageType: 'search',
+    source: \Lexis\Client::detectSource($referrer, $host),
+    referrer: $referrer,
+    landingUrl: $_SERVER['REQUEST_URI'] ?? null,
+);
+
+// HOMEPAGE
+$lexis->recordView(
+    pageType: 'home',
+    source: \Lexis\Client::detectSource($referrer, $host),
+    referrer: $referrer,
+    landingUrl: '/',
+);
+```
+
+### Auto-detect `source`
+
+The static helper `Client::detectSource($referrer, $currentHost)`
+classifies the visitor's origin into one of five buckets:
+
+| Referrer                                       | Source     |
+|------------------------------------------------|------------|
+| `null` / empty / unparseable                   | `direct`   |
+| External domain (`google.com`, `facebook.com`) | `external` |
+| Same origin + `/search` or `/cautare` path     | `search`   |
+| Same origin + `/?q=...` query                  | `search`   |
+| Same origin + `/category/` or `/categorie/`    | `category` |
+| Same origin + any other path                   | `referral` |
+
+For storefronts with non-standard URLs (e.g. `/products-cat-boots/`
+for categories), pass `source` to `recordView` directly without
+going through `detectSource`.
+
+### Full traffic journeys
+
+Three storyboards that combine the SDK calls into end-to-end flows:
+
+**Journey A — Google → product page directly (single page hit):**
+
+```php
+// Visitor lands on /produse/bocanci-timberland from Google search.
+// $_SERVER['HTTP_REFERER'] === 'https://www.google.com/search?q=bocanci+timberland'
+
+$lexis->recordView(
+    pageType: 'product',
+    source: \Lexis\Client::detectSource(
+        $_SERVER['HTTP_REFERER'] ?? null,
+        $_SERVER['HTTP_HOST'] ?? null,
+    ),  // → 'external'
+    productId: $product->id,
+    referrer: $_SERVER['HTTP_REFERER'] ?? null,
+    landingUrl: $_SERVER['REQUEST_URI'] ?? null,
+);
+// Engine logs: external traffic from google.com → product sku-1234
+```
+
+**Journey B — Google → internal search → click result → product page:**
+
+```php
+// 1) On the search-results page, after the search call:
+$result = $lexis->search('products', $_GET['q']);
+$lexis->recordView(
+    pageType: 'search',
+    source: \Lexis\Client::detectSource(/* ... */),  // → 'external' (came from Google)
+    referrer: $_SERVER['HTTP_REFERER'] ?? null,
+    landingUrl: $_SERVER['REQUEST_URI'] ?? null,
+);
+
+// 2) Stamp qid onto every result link so click attribution fires:
+foreach ($result->hits as $hit) {
+    $href = $lexis->withQid("/produse/{$hit->id}", $result->qid);
+    // <a href="{$href}">…</a>
+}
+
+// 3) Visitor clicks a result. On the product page, BOTH calls fire:
+$qid = $_GET[\Lexis\Client::ATTRIBUTION_PARAM] ?? null;
+if ($qid) {
+    $lexis->recordClick('products', $qid, $product->id);
+}
+$lexis->recordView(
+    pageType: 'product',
+    source: \Lexis\Client::detectSource(/* ... */),  // → 'search' (came from same-origin /search)
+    productId: $product->id,
+    referrer: $_SERVER['HTTP_REFERER'] ?? null,
+    landingUrl: $_SERVER['REQUEST_URI'] ?? null,
+    qid: $qid,  // join key against the original search event
+);
+```
+
+**Journey C — Internal browsing (homepage → category → product):**
+
+```php
+// Each page just calls recordView once. detectSource picks up the
+// same-origin path and classifies correctly without the controller
+// having to know.
+//   /            → source: direct  (no referrer)
+//   /categorie/bocanci   → source: referral  (came from /)
+//   /produse/sku-X       → source: category  (came from /categorie/...)
+```
+
+### Privacy
+
+The SDK **never sends the full referrer URL** — it extracts only the
+host (`google.com`) before posting. This protects PII that can leak
+through referrer query strings (`utm_*`, partner ids, marketing
+recipient markers). The engine re-validates the host on its side
+and only accepts the already-extracted string.
+
+`landingUrl` is forwarded as-is, but the storefront **must strip**
+query params and fragments before passing it. The engine does not
+index `landingUrl` for analytics — it's stored only for ops
+debugging.
+
+### Framework integration
+
+**Laravel** — middleware that runs on every request:
+
+```php
+// app/Http/Middleware/LexisJourneyTracker.php
+public function handle(Request $request, Closure $next)
+{
+    $response = $next($request);
+    try {
+        $lexis = app(\Lexis\Client::class);
+        // ... determine pageType + productId from route binding ...
+        $lexis->recordView(/* ... */);
+    } catch (\Lexis\Exception\LexisException $e) {
+        report($e);  // log but never break the response
+    }
+    return $response;
+}
+```
+
+**Symfony** — kernel.response event subscriber, same shape.
+
+**WordPress** — `template_redirect` action hook on each page template
+(single product, archive, page).
+
+### Best-effort
+
+`recordView` throws `LexisException` on network / 4xx / 5xx — wrap
+the call in try/catch so analytics noise never breaks the page render:
+
+```php
+try {
+    $lexis->recordView(/* ... */);
+} catch (\Lexis\Exception\LexisException $e) {
+    error_log('lexis view tracking: ' . $e->getMessage());
+}
+```
+
 ## Error handling
 
 All SDK exceptions extend `\Lexis\Exception\LexisException`. Catch that if

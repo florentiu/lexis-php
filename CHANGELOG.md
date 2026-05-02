@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.2.1 — page-view tracking docs in README
+
+The README that Packagist surfaces (and that every developer reads
+first when they `composer require lexis/lexis-php`) had no mention
+of page-view tracking — the feature shipped in v0.2.0, but only the
+docs site at lexis.software/docs/sdk/php documented it. Anyone
+following the README alone would never know `recordView()`,
+`detectSource()`, or the `/analytics/journeys` dashboard surface
+existed.
+
+Docs-only fix:
+
+  * Adds a "Page-view tracking" section between "Click attribution"
+    and "Error handling" with: a one-call quickstart, copy-paste
+    examples for product / category / search / homepage templates,
+    the auto-detect rules for `source`, three end-to-end journey
+    storyboards (Google→product, Google→search→click→product,
+    internal browsing), privacy notes, framework integration
+    sketches (Laravel / Symfony / WordPress), and the best-effort
+    try/catch pattern.
+
+No code changes. v0.2.0 callers keep working without any update —
+this release is purely a documentation correctness fix so Packagist
+readers see the feature exists.
+
 ## v0.2.0 — page-view tracking
 
 Adds generic page-view tracking — fires once per product / category /
