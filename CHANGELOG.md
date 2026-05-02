@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.2.0 — page-view tracking
+
+Adds generic page-view tracking — fires once per product / category /
+search-results / home page hit on the storefront, regardless of how
+the visitor got there. Powers the upcoming `/analytics/journeys` view
+in the dashboard (per-product entry sources, top referring domains,
+search-to-view funnel). Distinct from `recordClick()`, which only
+fires when the visit originated from a Lexis search result.
+
+  * **`Client::recordView(pageType, source, productId?, categorySlug?, referrer?, landingUrl?, qid?)`** —
+    minimal positional API matching the existing `recordClick`
+    style. Throws `LexisException` on hard failures; wrap in
+    try/catch if analytics noise must not break the page render.
+  * **`Client::detectSource($referrer, $currentHost)`** — heuristic
+    classifier that maps `HTTP_REFERER` to one of `direct` /
+    `search` / `category` / `external` / `referral`. Most
+    storefronts can adopt the defaults; bespoke URL conventions
+    can pass `source` to `recordView()` explicitly.
+  * **`Client::extractReferrerHost($referrer)`** — strict host
+    extractor mirroring the engine's `extract_referrer_host`. The
+    SDK strips full URLs to just the host BEFORE sending so PII in
+    the referrer query string (utm_*, partner ids, email markers)
+    never crosses the network.
+
+Engine-side this corresponds to lexis-server `0.5.0` — adds the
+`POST /api/v1/view` endpoint, the `CF_VIEWS` column family, and the
+`GET /v1/admin/orgs/:org/views` admin reader.
+
+### Migration
+
+Purely additive — no breaking changes. v0.1.3 callers keep working
+unchanged. To start collecting page-view data, add one call per
+page template:
+
+```php
+$referrer = $_SERVER['HTTP_REFERER'] ?? null;
+$lexis->recordView(
+    pageType: 'product',
+    source: \Lexis\Client::detectSource($referrer, $_SERVER['HTTP_HOST'] ?? null),
+    productId: $product->id,
+    referrer: $referrer,
+    landingUrl: $_SERVER['REQUEST_URI'] ?? null,
+    qid: $_GET[\Lexis\Client::ATTRIBUTION_PARAM] ?? null,
+);
+```
+
+See `/sdk/php` on the docs site for the full integration guide.
+
+### Tests
+
+33/33 pass with four new tests covering the recordView wire shape,
+referrer-host privacy stripping, source auto-detection across all
+five buckets, and host extraction edge cases (mixed case, ports,
+bare hosts, garbage input).
+
 ## v0.1.3 — document filtering
 
 The `filters` parameter on `Client::search()` has been functional

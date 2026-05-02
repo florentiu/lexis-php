@@ -326,6 +326,194 @@ final class Client
     }
 
     /**
+     * Record a generic page-view event — fires once per product /
+     * category / search-results / home page hit on the storefront,
+     * regardless of where the visitor came from. Powers the
+     * dashboard's `/analytics/journeys` page (per-product entry
+     * sources, top referring domains, search-to-view funnel).
+     *
+     * Distinct from {@see recordClick()}: that one ONLY fires when
+     * the visit originated from a Lexis search result (because it
+     * needs `?lexis_qid` on the landing URL). `recordView` fires on
+     * every page hit — including external traffic from Google,
+     * direct traffic from bookmarks, and same-site browsing through
+     * categories that never touched the search bar.
+     *
+     *     // In your product-page controller:
+     *     $referrer = $_SERVER['HTTP_REFERER'] ?? null;
+     *     $lexis->recordView(
+     *         pageType: 'product',
+     *         source: \Lexis\Client::detectSource(
+     *             $referrer,
+     *             $_SERVER['HTTP_HOST'] ?? null,
+     *         ),
+     *         productId: $product->id,
+     *         referrer: $referrer,
+     *         landingUrl: $_SERVER['REQUEST_URI'] ?? null,
+     *         qid: $_GET[\Lexis\Client::ATTRIBUTION_PARAM] ?? null,
+     *     );
+     *
+     * Privacy: the SDK extracts only the referrer HOST (e.g.
+     * `google.com`) before forwarding — full referrer URLs can carry
+     * PII in their query string and we don't want that leaving the
+     * storefront. Same-origin landing URLs are forwarded as-is; the
+     * caller SHOULD strip query params + fragments before passing
+     * them.
+     *
+     * Best-effort: throws on hard failures (network, 4xx, 5xx) but
+     * the storefront SHOULD wrap the call in a try/catch — analytics
+     * noise must never break the product page render.
+     *
+     * @param string      $pageType     Page kind. One of: `search`, `product`, `category`, `home`, `other`.
+     * @param string      $source       Where the visitor came from. One of: `search`, `category`, `direct`, `external`, `referral`. Use {@see detectSource()} for auto-detection.
+     * @param string|null $productId    Primary key when `$pageType === 'product'`.
+     * @param string|null $categorySlug Category slug when `$pageType === 'category'`.
+     * @param string|null $referrer     Full referrer URL — host extracted on this side before sending.
+     * @param string|null $landingUrl   Same-origin path the user landed on. Strip query params before passing.
+     * @param string|null $qid          Lexis qid when the visit traces back to a `/search` (read from `$_GET['lexis_qid']`).
+     */
+    public function recordView(
+        string $pageType,
+        string $source,
+        ?string $productId = null,
+        ?string $categorySlug = null,
+        ?string $referrer = null,
+        ?string $landingUrl = null,
+        ?string $qid = null
+    ): void {
+        $body = [
+            'page_type' => $pageType,
+            'source' => $source,
+        ];
+        if ($productId !== null && $productId !== '') {
+            $body['product_id'] = $productId;
+        }
+        if ($categorySlug !== null && $categorySlug !== '') {
+            $body['category_slug'] = $categorySlug;
+        }
+        if ($referrer !== null && $referrer !== '') {
+            // Pre-extract host on the SDK side so the engine never
+            // sees the full URL — minimises what crosses the
+            // network and keeps PII (utm_*, partner ids, email
+            // recipients in marketing links) on your server.
+            $host = self::extractReferrerHost($referrer);
+            if ($host !== null) {
+                $body['referrer_host'] = $host;
+            }
+        }
+        if ($landingUrl !== null && $landingUrl !== '') {
+            $body['landing_url'] = $landingUrl;
+        }
+        if ($qid !== null && $qid !== '') {
+            $body['qid'] = $qid;
+        }
+        $this->request('POST', '/api/v1/view', $body);
+    }
+
+    /**
+     * Heuristic source classifier for {@see recordView()}. Inspects
+     * the `Referer` header (yes, that's how HTTP misspells it) and
+     * compares against the storefront's own host to decide whether
+     * the visit came from search / category / direct / external /
+     * referral.
+     *
+     * Rules (in order):
+     *   1. Empty / unparseable referrer → `direct`.
+     *   2. Different host (ignoring `www.`) → `external`.
+     *   3. Same host + path containing `/search` or `/cautare`, or
+     *      a `?q=` query string → `search`.
+     *   4. Same host + path containing `/category/` or
+     *      `/categorie/` → `category`.
+     *   5. Same host + anything else → `referral`.
+     *
+     * The rules are deliberately minimal — most storefronts can
+     * accept the defaults, and ones with bespoke URL conventions
+     * (e.g. `/products/cat-bocanci/` for a category) should pass
+     * the explicit `source` argument to `recordView()` directly.
+     *
+     * @param string|null $referrer    Full referrer URL (read from `$_SERVER['HTTP_REFERER']`).
+     * @param string|null $currentHost The storefront's own host (read from `$_SERVER['HTTP_HOST']`).
+     */
+    public static function detectSource(?string $referrer, ?string $currentHost): string
+    {
+        if ($referrer === null || $referrer === '') {
+            return 'direct';
+        }
+        $parts = @parse_url($referrer);
+        if (!is_array($parts) || !isset($parts['host'])) {
+            return 'direct';
+        }
+        $referrerHost = strtolower((string) $parts['host']);
+        $current = strtolower((string) ($currentHost ?? ''));
+
+        // Strip leading `www.` for both sides so the comparison
+        // doesn't reject `www.example.com` ↔ `example.com` as
+        // different origins.
+        $stripWww = static fn(string $h): string => preg_replace('/^www\./', '', $h) ?? $h;
+        if ($current === '' || $stripWww($referrerHost) !== $stripWww($current)) {
+            return 'external';
+        }
+
+        $path = isset($parts['path']) ? (string) $parts['path'] : '/';
+        $query = isset($parts['query']) ? (string) $parts['query'] : '';
+
+        // `?q=...` (Google-style query strings on search pages)
+        // counts as a search even when the path is `/`.
+        if (
+            preg_match('#/(search|cautare)#i', $path) === 1 ||
+            preg_match('/(?:^|&)q=/i', $query) === 1
+        ) {
+            return 'search';
+        }
+        if (preg_match('#/(category|categorie)/#i', $path) === 1) {
+            return 'category';
+        }
+        return 'referral';
+    }
+
+    /**
+     * Extract just the host from a referrer URL, lowercased and
+     * with port / userinfo stripped. Returns `null` on garbage.
+     *
+     * Mirrors the engine's `extract_referrer_host` parser so the
+     * value the SDK forwards as `referrer_host` is identical to
+     * what the engine would have computed from a full `referrer` —
+     * we just do it on this side for privacy (the full URL never
+     * crosses the network).
+     */
+    public static function extractReferrerHost(?string $referrer): ?string
+    {
+        if ($referrer === null || $referrer === '') {
+            return null;
+        }
+        $parts = @parse_url($referrer);
+        if (is_array($parts) && isset($parts['host'])) {
+            return strtolower((string) $parts['host']);
+        }
+        // Fall back to a manual parse for inputs `parse_url` rejects
+        // (e.g. bare `host.com/path` without a scheme). Same algorithm
+        // as the engine's parser: drop scheme, drop path, drop port,
+        // drop userinfo, lowercase, validate it has a dot.
+        $s = trim($referrer);
+        if (str_contains($s, '://')) {
+            $s = substr($s, strpos($s, '://') + 3);
+        } elseif (str_starts_with($s, '//')) {
+            $s = substr($s, 2);
+        }
+        $s = explode('/', $s, 2)[0];
+        $s = explode('?', $s, 2)[0];
+        $s = explode('#', $s, 2)[0];
+        if (str_contains($s, '@')) {
+            $s = substr($s, strrpos($s, '@') + 1);
+        }
+        if (str_contains($s, ':')) {
+            $s = substr($s, 0, strpos($s, ':'));
+        }
+        $s = strtolower(trim($s));
+        return ($s !== '' && str_contains($s, '.')) ? $s : null;
+    }
+
+    /**
      * Pull the click-attribution rollup the engine builds in-memory from
      * search × click events. Returns a typed view ready to render in the
      * dashboard or a self-hosted admin page.

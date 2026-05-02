@@ -432,6 +432,184 @@ final class ClientTest extends TestCase
         $this->assertArrayNotHasKey('landing_url', $body);
     }
 
+    public function testRecordViewPostsFullPayloadAndStripsReferrerToHost(): void
+    {
+        // Full payload — SDK must strip the referrer URL down to just
+        // its host BEFORE sending. The wire shape carries
+        // `referrer_host` (not `referrer`); the full URL with PII in
+        // the query string never crosses the network.
+        $this->transport->queue(200, [
+            'id' => 'view-1',
+            'page_type' => 'product',
+            'source' => 'external',
+            'created_at_ms' => 1_700_000_000_000,
+        ]);
+
+        $this->client->recordView(
+            'product',
+            'external',
+            'sku-1234',                                          // productId
+            null,                                                // categorySlug
+            'https://google.com/search?q=user@example.com',      // referrer (PII!)
+            '/produse/bocanci-timberland',                       // landingUrl
+            'q_a8f4kx2j'                                         // qid
+        );
+
+        $body = json_decode($this->transport->calls[0]['body'], true);
+        $this->assertSame('product', $body['page_type']);
+        $this->assertSame('external', $body['source']);
+        $this->assertSame('sku-1234', $body['product_id']);
+        // Privacy assertion: only the host crosses the network.
+        $this->assertSame('google.com', $body['referrer_host']);
+        $this->assertArrayNotHasKey('referrer', $body, 'Full referrer must NOT be sent');
+        $this->assertSame('/produse/bocanci-timberland', $body['landing_url']);
+        $this->assertSame('q_a8f4kx2j', $body['qid']);
+        $this->assertArrayNotHasKey('category_slug', $body);
+    }
+
+    public function testRecordViewOmitsOptionalFieldsWhenNotProvided(): void
+    {
+        // Minimal call — only the two required fields. SDK must not
+        // ship empty/null optional fields; the engine's serde would
+        // accept them but the wire shape stays cleaner.
+        $this->transport->queue(200, [
+            'id' => 'view-2',
+            'page_type' => 'home',
+            'source' => 'direct',
+            'created_at_ms' => 1_700_000_000_000,
+        ]);
+
+        $this->client->recordView('home', 'direct');
+
+        $body = json_decode($this->transport->calls[0]['body'], true);
+        $this->assertSame('home', $body['page_type']);
+        $this->assertSame('direct', $body['source']);
+        $this->assertArrayNotHasKey('product_id', $body);
+        $this->assertArrayNotHasKey('category_slug', $body);
+        $this->assertArrayNotHasKey('referrer_host', $body);
+        $this->assertArrayNotHasKey('landing_url', $body);
+        $this->assertArrayNotHasKey('qid', $body);
+    }
+
+    public function testDetectSourceClassifiesEachReferrerKind(): void
+    {
+        // No referrer → direct.
+        $this->assertSame(
+            'direct',
+            Client::detectSource(null, 'shop.example.ro')
+        );
+        $this->assertSame(
+            'direct',
+            Client::detectSource('', 'shop.example.ro')
+        );
+        // Garbage referrer that parse_url can't handle → still direct.
+        $this->assertSame(
+            'direct',
+            Client::detectSource('not-a-url', 'shop.example.ro')
+        );
+        // External domain → external. www. prefix is normalised.
+        $this->assertSame(
+            'external',
+            Client::detectSource(
+                'https://google.com/search?q=bocanci',
+                'shop.example.ro'
+            )
+        );
+        $this->assertSame(
+            'external',
+            Client::detectSource(
+                'https://www.facebook.com/share',
+                'shop.example.ro'
+            )
+        );
+        // Same origin + /search path → search.
+        $this->assertSame(
+            'search',
+            Client::detectSource(
+                'https://shop.example.ro/search?q=ghete',
+                'shop.example.ro'
+            )
+        );
+        // Same origin + Romanian path → search.
+        $this->assertSame(
+            'search',
+            Client::detectSource(
+                'https://shop.example.ro/cautare?q=ghete',
+                'shop.example.ro'
+            )
+        );
+        // Same origin + Google-style ?q=... at root → search.
+        $this->assertSame(
+            'search',
+            Client::detectSource(
+                'https://shop.example.ro/?q=ghete',
+                'shop.example.ro'
+            )
+        );
+        // Same origin + /categorie/... → category.
+        $this->assertSame(
+            'category',
+            Client::detectSource(
+                'https://shop.example.ro/categorie/bocanci',
+                'shop.example.ro'
+            )
+        );
+        // Same origin + /category/ (English) → category.
+        $this->assertSame(
+            'category',
+            Client::detectSource(
+                'https://shop.example.ro/category/boots',
+                'shop.example.ro'
+            )
+        );
+        // Same origin + arbitrary path → referral.
+        $this->assertSame(
+            'referral',
+            Client::detectSource(
+                'https://shop.example.ro/blog/iarna-2026',
+                'shop.example.ro'
+            )
+        );
+        // www.<host> on referrer matches plain <host> on currentHost.
+        $this->assertSame(
+            'referral',
+            Client::detectSource(
+                'https://www.shop.example.ro/blog/iarna-2026',
+                'shop.example.ro'
+            )
+        );
+    }
+
+    public function testExtractReferrerHostStripsPathAndPort(): void
+    {
+        // Standard URL → bare host.
+        $this->assertSame(
+            'google.com',
+            Client::extractReferrerHost(
+                'https://google.com/search?q=user@example.com'
+            )
+        );
+        // Mixed case → lower.
+        $this->assertSame(
+            'facebook.com',
+            Client::extractReferrerHost('https://Facebook.COM/share')
+        );
+        // Port → stripped (parse_url returns it separately so the host is clean).
+        $this->assertSame(
+            'shop.example.ro',
+            Client::extractReferrerHost('https://shop.example.ro:8443/p/123')
+        );
+        // Bare host with no scheme → fallback parser.
+        $this->assertSame(
+            'partner.ro',
+            Client::extractReferrerHost('partner.ro/path?token=abc')
+        );
+        // Garbage → null.
+        $this->assertNull(Client::extractReferrerHost(null));
+        $this->assertNull(Client::extractReferrerHost(''));
+        $this->assertNull(Client::extractReferrerHost('not-a-url'));
+    }
+
     public function testGetClickAttributionDecodesResponse(): void
     {
         $this->transport->queue(200, [
