@@ -5,7 +5,7 @@
  * one PHP file.
  *
  * Drop this into a controller / template that handles
- *   /search?q=tricou&page=1&sort=price_asc&culoare[]=Rosu&marca[]=Renania
+ *   /search?q=tricou&page=1&sort=price_asc&culoare[]=Rosu&marca[]=Acme
  *
  * The pattern is **one search per render**: every piece of UI state
  * (filters, sort, page, group, facets) goes into a single `search()`

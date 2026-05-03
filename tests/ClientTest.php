@@ -966,7 +966,7 @@ final class ClientTest extends TestCase
             'facets' => [
                 'marca' => [
                     ['value' => 'Cofra', 'count' => 24],
-                    ['value' => 'Renania', 'count' => 18],
+                    ['value' => 'Acme', 'count' => 18],
                 ],
                 'tip_de_protectie' => [
                     ['value' => 'S1P', 'count' => 9],
@@ -985,7 +985,7 @@ final class ClientTest extends TestCase
         $this->assertCount(2, $result->facets['marca']);
         $this->assertSame('Cofra', $result->facets['marca'][0]->value);
         $this->assertSame(24, $result->facets['marca'][0]->count);
-        $this->assertSame('Renania', $result->facets['marca'][1]->value);
+        $this->assertSame('Acme', $result->facets['marca'][1]->value);
         $this->assertCount(1, $result->facets['tip_de_protectie']);
         $this->assertSame('S1P', $result->facets['tip_de_protectie'][0]->value);
         $this->assertSame(9, $result->facets['tip_de_protectie'][0]->count);

@@ -173,7 +173,7 @@ through `explode_doc(parent, template)` server-side: the engine reads a
 named blob column on the doc, parses it, and emits one document per
 variant.
 
-The default Renania-style template:
+A typical fashion / apparel template (size × color × price × stock):
 
 ```
 source_column      = "combinatii_marime-culoare-pret-stoc"
@@ -245,7 +245,7 @@ want to keep that schema). Your PHP script reads per-variant rows from
 the DB, groups them by parent, and assembles the blob before pushing.
 
 ```php
-$run = $lexis->sync->start('renania-b2c-romana');
+$run = $lexis->sync->start('products');
 
 // Source: per-variant rows ordered by parent_id so we can stream-group
 // without holding the whole catalog in memory.
@@ -329,7 +329,7 @@ off, so the engine indexes verbatim. You give each variant a unique PK
 every row so the variant is independently searchable.
 
 ```php
-$run = $lexis->sync->start('renania-b2c-romana');
+$run = $lexis->sync->start('products');
 
 $batch = [];
 foreach (fetchVariantsFromDb() as $row) {
@@ -407,7 +407,7 @@ SDK pushes:
 Diagnostic:
 
 ```php
-$result = $lexis->search('renania-b2c-romana', 'tricou', 1, 0, null, null, [
+$result = $lexis->search('products', 'shirt', 1, 0, null, null, [
     'groupBy' => 'parent_id',
 ]);
 foreach ($result->hits as $hit) {

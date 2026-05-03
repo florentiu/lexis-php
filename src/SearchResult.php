@@ -136,7 +136,7 @@ final class SearchResult
      * name for the engine identifier; fall back to the identifier
      * itself when no label is registered.
      *
-     *     // Render: "Marcă: Cofra (24), Renania (18), Malfini (7)"
+     *     // Render: "Brand: Acme (24), Globex (18), Initech (7)"
      *     foreach ($result->facets['marca'] ?? [] as $bucket) {
      *         echo $bucket->value . ' (' . $bucket->count . ')';
      *     }

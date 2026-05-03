@@ -186,14 +186,14 @@ back over HTTP. The PHP SDK decodes this into the typed shape above.
       "payload": {
         "id": "5454-rosu-XL",
         "parent_id": "5454",
-        "denumire_produs": "Tricou tehnic Renania",
+        "denumire_produs": "Tricou tehnic Acme",
         "pret": 49.0,
         "stoc": 12,
-        "marca": "Renania",
+        "marca": "Acme",
         "culoare": "Rosu",
         "marime": "XL",
         "imagine": "https://...",
-        "url": "/produse/tricou-tehnic-renania"
+        "url": "/produse/tricou-tehnic-acme"
       },
       "cursor": "eyJvZmZzZXQiOjksImxhc3RfaWQiOiI1NDU0LXJvc3UtWEwifQ",
       "grouped_count": 4
@@ -208,7 +208,7 @@ back over HTTP. The PHP SDK decodes this into the typed shape above.
   "facets": {
     "marca": [
       {"value": "Cofra",   "count": 24},
-      {"value": "Renania", "count": 18},
+      {"value": "Acme",    "count": 18},
       {"value": "Malfini", "count":  7}
     ],
     "culoare": [
