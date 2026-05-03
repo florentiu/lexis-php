@@ -111,13 +111,15 @@ final class Client
     /**
      * Full-text search against a committed index.
      *
-     * Supports two pagination styles:
+     * ## Pagination
      *
      *   * **Shallow** — pass `$offset` (0, 20, 40, ...). Cheap up to a few
      *     hundred rows; the engine still has to walk every skipped row.
      *   * **Deep** — pass `$searchAfter` with the previous page's
      *     {@see SearchResult::$nextCursor}. O(page) regardless of depth;
-     *     `$offset` is ignored when a cursor is set.
+     *     `$offset` is ignored when a cursor is set. NOT compatible with
+     *     `groupBy` (the engine returns 400 — use `$offset` instead when
+     *     grouping is on).
      *
      * Use deep pagination past ~1k results, or for any "walk the whole
      * catalog" loop:
@@ -129,12 +131,11 @@ final class Client
      *         $cursor = $r->nextCursor;
      *     } while ($cursor !== null);
      *
-     * Filters narrow the candidate set BEFORE ranking — they're applied
-     * server-side against the engine's tag and numeric indexes (configured
-     * at index creation as `tag:` / `numeric:` mappings). Three operator
-     * shapes are supported, identifiable by `op`:
+     * ## Filters (applied BEFORE ranking)
      *
-     *     // 1) Exact tag match — useful for brand, category, etc.
+     * Three operator shapes, identifiable by `op`:
+     *
+     *     // 1) Exact tag match — brand, category, color, etc.
      *     ['op' => 'tag_eq', 'field' => 'brand', 'value' => 'Nike']
      *
      *     // 2) Any-of tag match — multiple acceptable values for one field.
@@ -143,18 +144,82 @@ final class Client
      *     // 3) Half-open numeric range — either bound may be omitted.
      *     ['op' => 'numeric_range', 'field' => 'price', 'min' => 100, 'max' => 500]
      *
-     * Multiple clauses combine with AND (every clause must match). Pass them
-     * as a list under a single `filters` argument:
+     * Multiple clauses combine with AND. Unknown fields (not declared as
+     * `tag:` / `numeric:` in the schema) return a 400.
      *
-     *     $r = $lexis->search('products', 'iarnă', 20, 0, [
-     *         ['op' => 'tag_eq', 'field' => 'brand', 'value' => 'Timberland'],
-     *         ['op' => 'numeric_range', 'field' => 'price', 'min' => 200, 'max' => 600],
-     *     ]);
+     * ## $options — sort, facets, grouping, boost
      *
-     * Unknown fields in a filter — fields the index wasn't configured to
-     * tag/index numerically — return a 400 from the engine. Make sure the
-     * index settings list those fields under `tagFields` /
-     * `numericFields` before sending filters that reference them.
+     * Optional 7th argument: an associative array of advanced features.
+     * All keys are optional; defaults match the storefront-friendly
+     * "BM25 relevance, no grouping, no facets" shape. Recognised keys:
+     *
+     *   * **`sort`** — `list<{field: string, direction: 'asc'|'desc'}>`.
+     *     Override BM25 with an explicit field sort. Three valid field
+     *     shapes:
+     *       - **Numeric+sortable field** (`pret`, `stoc`) — typical price
+     *         asc/desc.
+     *       - **Tag field that matches `groupBy`** (`parent_id`) — engine
+     *         parses the group key as f64 (use case: "newest = parent_id
+     *         desc"). Lex sort on tag ords would put "999" > "1000".
+     *       - **Text field with `groupBy` active** (`denumire_produs`) —
+     *         engine reads each group representative's payload and
+     *         lex-sorts case-insensitive. Use case: "Name A-Z / Z-A" on
+     *         a variant-collapsed listing.
+     *     Mutually exclusive with `boost` (engine returns 400). Hybrid
+     *     bypasses to BM25-only when sort is non-empty.
+     *
+     *   * **`groupBy`** — `string`. Field collapsing — dedupes hits on
+     *     the value of this field, keeping the best-scored hit per group
+     *     and reporting the sibling count via `$hit->groupedCount`.
+     *     Field MUST be `tag` kind. `count_estimate` returns UNIQUE
+     *     groups. `searchAfter` is rejected when grouping is on.
+     *
+     *   * **`facets`** — `list<string>`. Bucket-count over the matching
+     *     set, returning `(value, count)` pairs per field for filter
+     *     sidebars. Each field must be `tag`-kind. Top-K capped at 200
+     *     per field. Buckets reflect the FILTERED set; for "uncheck me
+     *     to see other values" UX, re-issue the search WITHOUT that
+     *     field's filter.
+     *
+     *   * **`autoFacet`** — `bool` (default false). Engine scans query
+     *     tokens against tag-field values and applies matches as
+     *     implicit `tag_eq` filters. "tricou portocaliu" →
+     *     `q=tricou + culoare:Portocaliu`. Applied filters surface in
+     *     `$result->autoFilters` as pre-checked chips.
+     *
+     *   * **`boost`** — `{field: string, function?: 'log'|'linear', weight?: float}`.
+     *     Numeric boost — multiplies BM25 by `1 + weight × f(value)`
+     *     where `f` is `log` (default, diminishing returns) or `linear`
+     *     (use only on bounded fields). Field must be `numeric` +
+     *     `sortable`. Classic use: `{field: 'stoc', function: 'log',
+     *     weight: 1.0}` → in-stock variants outrank out-of-stock peers
+     *     without dominating relevance.
+     *
+     *   * **`prefixLast`** — `bool` (default false). Treat the last
+     *     query token as a prefix — autocomplete mode. "adi" matches
+     *     "adidași".
+     *
+     *   * **`hybrid`** — `bool` (default false). BM25 + vector cosine
+     *     fused via Reciprocal Rank Fusion. Requires the index to be
+     *     built with `vector.enabled = true`. Quietly bypasses to BM25
+     *     when the vector path isn't available.
+     *
+     * Example — variant catalog with sort, group, facets, boost:
+     *
+     *     $result = $lexis->search(
+     *         'products',
+     *         'tricou rosu',
+     *         20,
+     *         0,
+     *         [['op' => 'tag_eq', 'field' => 'culoare', 'value' => 'Rosu']],
+     *         null,
+     *         [
+     *             'sort'    => [['field' => 'pret', 'direction' => 'asc']],
+     *             'groupBy' => 'parent_id',
+     *             'facets'  => ['marca', 'culoare', 'marime'],
+     *             'autoFacet' => true,
+     *         ]
+     *     );
      *
      * @param string                     $index       Slug of the index to query.
      * @param string                     $query       User query; up to 500 chars.
@@ -162,6 +227,7 @@ final class Client
      * @param int|null                   $offset      0-based pagination; ignored when `$searchAfter` is set.
      * @param list<array<string, mixed>>|null $filters Filter clauses combined with AND. See above for the operator shapes.
      * @param string|null                $searchAfter `search_after` cursor; consume {@see SearchResult::$nextCursor}.
+     * @param array<string, mixed>|null  $options     Advanced options (sort, groupBy, facets, autoFacet, boost, prefixLast, hybrid).
      */
     public function search(
         string $index,
@@ -169,7 +235,8 @@ final class Client
         ?int $limit = null,
         ?int $offset = null,
         ?array $filters = null,
-        ?string $searchAfter = null
+        ?string $searchAfter = null,
+        ?array $options = null
     ): SearchResult {
         $body = ['index' => $index, 'q' => $query];
         if ($limit !== null) {
@@ -186,6 +253,58 @@ final class Client
             // still forward both if the caller passed them so server
             // logs reflect the caller's intent.
             $body['search_after'] = $searchAfter;
+        }
+        if ($options !== null) {
+            // Selectively forward each known option. Done as
+            // explicit checks (rather than blind array_merge) so:
+            //   1) Typos surface as "didn't work" instead of being
+            //      silently passed to the engine and discarded by
+            //      its serde rejection.
+            //   2) The wire shape stays predictable for log
+            //      consumers.
+            //   3) Field-name translation between PHP camelCase
+            //      and engine snake_case happens in one place.
+            if (isset($options['sort']) && is_array($options['sort'])) {
+                $body['sort'] = array_values($options['sort']);
+            }
+            if (isset($options['groupBy']) && is_string($options['groupBy']) && $options['groupBy'] !== '') {
+                $body['group_by'] = $options['groupBy'];
+            }
+            if (isset($options['facets']) && is_array($options['facets'])) {
+                $body['facets'] = array_values($options['facets']);
+            }
+            if (array_key_exists('autoFacet', $options)) {
+                $body['auto_facet'] = (bool) $options['autoFacet'];
+            }
+            if (isset($options['boost']) && is_array($options['boost'])) {
+                $body['boost'] = $options['boost'];
+            }
+            // Per-request orchestrator knobs collapse under a single
+            // `options` block on the wire (matches `SearchOptions` on
+            // the engine side). Build it lazily so we only send keys
+            // the caller actually set.
+            $engineOptions = [];
+            if (array_key_exists('prefixLast', $options)) {
+                $engineOptions['prefix_last'] = (bool) $options['prefixLast'];
+            }
+            if (array_key_exists('hybrid', $options)) {
+                $engineOptions['hybrid'] = (bool) $options['hybrid'];
+            }
+            if (array_key_exists('rerank', $options)) {
+                $engineOptions['rerank'] = (bool) $options['rerank'];
+            }
+            if (array_key_exists('autoCorrect', $options)) {
+                $engineOptions['auto_correct'] = (bool) $options['autoCorrect'];
+            }
+            if (array_key_exists('fallback', $options)) {
+                $engineOptions['fallback'] = (bool) $options['fallback'];
+            }
+            if (array_key_exists('requireAllTokens', $options)) {
+                $engineOptions['require_all_tokens'] = (bool) $options['requireAllTokens'];
+            }
+            if ($engineOptions !== []) {
+                $body['options'] = $engineOptions;
+            }
         }
 
         $data = $this->request('POST', '/api/v1/search', $body);

@@ -21,7 +21,7 @@ use Lexis\Http\Transport;
 final class Config
 {
     public const DEFAULT_BASE_URL = 'https://lexis.software';
-    public const DEFAULT_USER_AGENT = 'lexis-php/0.1.0';
+    public const DEFAULT_USER_AGENT = 'lexis-php/0.3.0';
 
     /** @readonly */
     public string $apiKey;

@@ -1,5 +1,329 @@
 # Changelog
 
+## v0.3.0 — sort, grouping, facets, auto-faceting, boost
+
+Big release that turns `Client::search()` from a flat full-text search
+call into the full storefront query surface — everything you need to
+build an Amazon-style listing page (sort + group + filter sidebar +
+boost + autocomplete) is now first-class on the SDK.
+
+The engine has supported all of this since `lexis-server 0.6.x` (sort,
+grouping, facets, boost, auto-faceting all landed in the Rust rewrite),
+but the PHP SDK was still a v0.1-era surface that only exposed
+`search(index, query, limit, offset, filters, searchAfter)`. v0.3.0
+brings the SDK in line.
+
+### Backward compatibility
+
+**Non-breaking.** v0.2.x callers continue to work without changes.
+The `search()` method gained a new optional 7th parameter
+(`?array $options = null`) — anyone using the existing 6-arg
+positional form keeps their behavior unchanged.
+
+The new typed fields on `SearchResult` (`facets`, `facetLabels`,
+`autoFilters`, `fallbackMode`) and the new field on `SearchHit`
+(`groupedCount`) default to empty / null on responses that don't
+carry them, so older engine builds and existing callers see zero
+behavior change.
+
+### What's new on the request
+
+`Client::search()` accepts an `$options` associative array as its
+7th argument. Every key is optional; defaults match the v0.2.x
+behavior.
+
+```php
+$result = $lexis->search(
+    'products',                          // index slug
+    'tricou rosu',                       // query
+    20,                                  // limit
+    0,                                   // offset
+    [                                    // filters (existing)
+        ['op' => 'tag_eq', 'field' => 'culoare', 'value' => 'Rosu'],
+    ],
+    null,                                // searchAfter (existing)
+    [                                    // $options (NEW)
+        'sort'      => [['field' => 'pret', 'direction' => 'asc']],
+        'groupBy'   => 'parent_id',
+        'facets'    => ['marca', 'culoare', 'marime'],
+        'autoFacet' => true,
+        'boost'     => ['field' => 'stoc', 'function' => 'log', 'weight' => 1.0],
+        'prefixLast' => false,
+        'hybrid'     => false,
+    ]
+);
+```
+
+Each key:
+
+  * **`sort`** — `list<{field, direction}>`. Override BM25 with an
+    explicit field sort. Three valid field shapes:
+      - **Numeric+sortable field** (`pret`, `stoc`) — typical price
+        asc/desc.
+      - **Tag field that matches `groupBy`** (`parent_id`) — engine
+        parses the group key as f64; use case "newest = parent_id
+        desc". Lex sort on tag ords would put "999" > "1000".
+      - **Text field with `groupBy` active** (`denumire_produs`) —
+        engine reads each group representative's payload and
+        lex-sorts case-insensitive. Use case "Name A-Z / Z-A" on a
+        variant-collapsed listing.
+    Mutually exclusive with `boost` (engine 400). Hybrid bypasses to
+    BM25-only when sort is non-empty.
+
+  * **`groupBy`** — `string`. Field collapsing — dedupes hits by the
+    value of this field, keeping the best-scored hit per group and
+    reporting siblings via `$hit->groupedCount`. Field MUST be `tag`
+    kind. `count_estimate` returns UNIQUE GROUPS (not raw variant
+    docs). `searchAfter` is rejected when grouping is on.
+
+  * **`facets`** — `list<string>`. Bucket-count over the matching set
+    for filter sidebars. Each field must be `tag`-kind. Top-K capped
+    at 200 per field. Buckets reflect the FILTERED set; for "uncheck
+    me to see other values" UX, re-issue the search WITHOUT that
+    field's filter.
+
+  * **`autoFacet`** — `bool` (default false). Engine scans query
+    tokens against tag-field values and applies matches as implicit
+    `tag_eq` filters. "tricou portocaliu" → `q=tricou +
+    culoare:Portocaliu`. Applied filters surface in
+    `$result->autoFilters` as pre-checked chips.
+
+  * **`boost`** — `{field, function?, weight?}`. Numeric boost —
+    multiplies BM25 by `1 + weight × f(value)` where `f` is `log`
+    (default, diminishing returns) or `linear`. Field must be
+    `numeric` + `sortable`. Classic use:
+    `{field:'stoc', function:'log', weight:1.0}` → in-stock variants
+    outrank out-of-stock peers without dominating relevance.
+
+  * **`prefixLast`** — `bool` (default false). Treat the last query
+    token as a prefix — autocomplete mode. "adi" matches "adidași".
+
+  * **`hybrid`** — `bool` (default false). BM25 + vector cosine fused
+    via Reciprocal Rank Fusion. Requires the index built with
+    `vector.enabled = true`; quietly bypasses to BM25 otherwise.
+
+  * **`rerank`**, **`autoCorrect`**, **`fallback`**,
+    **`requireAllTokens`** — orchestrator knobs (default `true`).
+    Override only when you need to disable a stage for an
+    experiment.
+
+### What's new on the response
+
+`SearchResult` exposes four new typed fields:
+
+  * **`$facets`** — `array<string, FacetBucket[]>`. Per-field bucket
+    lists in `(count desc, value asc)` order. Empty when no facets
+    were requested.
+
+  * **`$facetLabels`** — `array<string, string>`. Maps engine
+    identifiers (`tip_de_protectie`) to display names
+    (`"Tip de protectie"`). Empty when the index has no label
+    registry. Pattern: `$labels[$field] ?? $field`.
+
+  * **`$autoFilters`** — `AppliedFilter[]`. Filters the engine
+    applied implicitly via `autoFacet`. Each entry exposes
+    `->toTagEqClause()` for promoting to an explicit filter on the
+    next request.
+
+  * **`$fallbackMode`** — `?string`. Set when the engine ran a
+    fallback path (`'strict'` / `'phonetic'` / `'union'`); null when
+    the primary BM25 pass had hits or fallback was disabled.
+    Storefronts use it to render a "Showing approximate matches"
+    hint.
+
+`SearchHit` exposes one new field:
+
+  * **`$groupedCount`** — `int`. Number of OTHER variants collapsed
+    under this hit when `groupBy` was active. Defaults to `0`
+    (single-member group OR grouping off). Pattern:
+    `"+{$hit->groupedCount} variante"`.
+
+### New typed classes
+
+  * **`Lexis\FacetBucket`** — `{string $value, int $count}`.
+  * **`Lexis\AppliedFilter`** — `{string $field, string $value}` plus
+    a `toTagEqClause()` helper for round-tripping through `filters`.
+
+### What the engine returns — full wire shape
+
+Reference for storefront authors who want to see exactly what comes
+back over HTTP. The PHP SDK decodes this into the typed shape above.
+
+```json
+{
+  "hits": [
+    {
+      "id": "5454-rosu-XL",
+      "score": 4.2,
+      "payload": {
+        "id": "5454-rosu-XL",
+        "parent_id": "5454",
+        "denumire_produs": "Tricou tehnic Renania",
+        "pret": 49.0,
+        "stoc": 12,
+        "marca": "Renania",
+        "culoare": "Rosu",
+        "marime": "XL",
+        "imagine": "https://...",
+        "url": "/produse/tricou-tehnic-renania"
+      },
+      "cursor": "eyJvZmZzZXQiOjksImxhc3RfaWQiOiI1NDU0LXJvc3UtWEwifQ",
+      "grouped_count": 4
+    }
+  ],
+  "count_estimate": 59,
+  "effective_query": "tricou rosu",
+  "suggestion": null,
+  "auto_corrected": false,
+  "fallback_mode": null,
+  "qid": "q_a8f4kx2j",
+  "facets": {
+    "marca": [
+      {"value": "Cofra",   "count": 24},
+      {"value": "Renania", "count": 18},
+      {"value": "Malfini", "count":  7}
+    ],
+    "culoare": [
+      {"value": "Albastru",   "count": 17},
+      {"value": "Negru",      "count": 14},
+      {"value": "Rosu",       "count":  9}
+    ],
+    "marime": [
+      {"value": "M",  "count": 22},
+      {"value": "L",  "count": 19},
+      {"value": "XL", "count": 17}
+    ]
+  },
+  "auto_filters": [
+    {"field": "culoare", "value": "Rosu"}
+  ],
+  "facet_labels": {
+    "tip_de_protectie": "Tip de protectie",
+    "denumire_produs":  "Denumire produs"
+  },
+  "diagnostics": {
+    "took_ms": 12,
+    "primary_hits": 11240,
+    "rerank_ms": 3,
+    "fallback_ms": 0
+  }
+}
+```
+
+Notes:
+  * `count_estimate` is UNIQUE PARENTS when `group_by` is active —
+    this listing has 59 distinct products, even if the index stores
+    11,240 raw variant docs.
+  * `grouped_count = 4` means this card represents 5 variants total
+    (representative + 4 siblings).
+  * `score` carries the BM25 score in the no-sort case, OR the sort
+    value re-packed for sort-mode searches. UI code shouldn't depend
+    on it being a relevance signal when `sort` was set.
+
+### Building a storefront filter page — the playbook
+
+Read `examples/storefront-with-filters.php` for a complete
+end-to-end script. The recommended pattern:
+
+1. **Read URL state** — `$q`, `$page`, `$sort`, `$selectedFilters`,
+   `$searchAfter` from `$_GET`. URL is the single source of truth so
+   filters survive refresh / back-button.
+
+2. **Issue ONE search per render** — pass everything in one call.
+   The engine returns hits, facets, and auto-filters in a single
+   round-trip. Don't issue a second "facets-only" search.
+
+3. **Render the filter sidebar from `$result->facets`** — one
+   block per requested facet field. Use `$result->facetLabels` for
+   the display name. Each bucket links to a URL that adds/removes
+   that `(field, value)` from the active filter set.
+
+4. **Render auto-filter chips from `$result->autoFilters`** —
+   pre-checked, with an "x" link that re-runs the search WITHOUT
+   that auto-filter (promote → explicit `tag_eq` then remove).
+
+5. **Render product cards from `$result->hits`** — show
+   `$hit->document['imagine']`, `$hit->document['denumire_produs']`,
+   `$hit->document['pret']`. If `$hit->groupedCount > 0`, show
+   "+{$hit->groupedCount} variante" under the price.
+
+6. **Pagination** — use `$result->total / $limit` for page count,
+   stamp `&page=N` on the URL, pass `offset = ($page-1) * $limit`
+   to the next call. (Don't use `searchAfter` when `groupBy` is
+   active — the engine rejects it.)
+
+7. **Stamp `?lexis_qid=...` on every product link** —
+   `$lexis->withQid($url, $result->qid)` — so click attribution
+   fires when the visitor clicks through.
+
+### Index requirements
+
+For all the new features to work, the index `mappings` must declare
+the right field kinds. The dashboard's "Settings → Index schema"
+page does this; if you build the schema by hand, the relevant bits
+are:
+
+```json
+{
+  "mappings": [
+    { "name": "denumire_produs", "kind": "TextAndTag", "facetable": true },
+    { "name": "pret",            "kind": "Numeric", "sortable": true },
+    { "name": "stoc",            "kind": "Numeric", "sortable": true },
+    { "name": "parent_id",       "kind": "Tag" },
+    { "name": "marca",           "kind": "Tag", "facetable": true },
+    { "name": "culoare",         "kind": "Tag", "facetable": true },
+    { "name": "marime",          "kind": "Tag", "facetable": true }
+  ]
+}
+```
+
+Field kind / option to feature mapping:
+
+| Feature              | Required mapping kind          | Required flags |
+|----------------------|--------------------------------|----------------|
+| `sort` (numeric)     | `Numeric`                      | `sortable: true` |
+| `sort` (parent_id)   | `Tag` matching `groupBy`       | —              |
+| `sort` (text/name)   | `Text` or `TextAndTag` + `groupBy` set | — |
+| `groupBy`            | `Tag`                          | —              |
+| `facets`             | `Tag`                          | (`facetable: true` is informational) |
+| `autoFacet`          | `Tag` (any tag field qualifies)| —              |
+| `boost`              | `Numeric`                      | `sortable: true` |
+| filter `tag_eq` / `tag_in`     | `Tag` or `TextAndTag` | — |
+| filter `numeric_range` | `Numeric`                    | — |
+
+### Tests
+
+41/41 pass. 8 new tests cover:
+
+  * options forwarded as the right wire keys (camelCase →
+    snake_case),
+  * options omitted when caller doesn't set them (backward compat),
+  * `grouped_count` decoded on each hit (with default 0 fallback),
+  * facets + facet_labels round-tripped to typed structures,
+  * auto_filters round-tripped + `toTagEqClause()` helper,
+  * `fallback_mode` exposed (and null by default),
+  * empty / blank options handled correctly (empty string `groupBy`
+    not sent, empty facets/sort lists ARE sent).
+
+### Migration
+
+Nothing to migrate — purely additive. To start using the new
+features, just pass an `$options` array on the calls that need them.
+v0.2.x callers using the legacy 6-arg positional form keep working
+without any change.
+
+```php
+// v0.2.x — still works in v0.3.0
+$result = $lexis->search('products', 'adidași', 20, 0);
+
+// v0.3.0 — new features via the options array
+$result = $lexis->search('products', 'adidași', 20, 0, null, null, [
+    'groupBy' => 'parent_id',
+    'sort'    => [['field' => 'pret', 'direction' => 'asc']],
+    'facets'  => ['marca'],
+]);
+```
+
 ## v0.2.1 — page-view tracking docs in README
 
 The README that Packagist surfaces (and that every developer reads

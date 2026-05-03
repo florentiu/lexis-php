@@ -14,8 +14,18 @@ namespace Lexis;
  *       "effective_query": "adidași",
  *       "suggestion": "adidași",        // optional, only on did-you-mean
  *       "auto_corrected": false,
- *       "fallback_mode": null,           // optional
+ *       "fallback_mode": null,           // optional: "strict" | "phonetic" | "union"
  *       "qid": "q_a8f4kx2j",             // empty when ?log=false
+ *       "facets": {                      // present only when `facets:[...]` requested
+ *         "marca":   [{"value":"Cofra","count":24}, ...],
+ *         "culoare": [{"value":"Albastru","count":17}, ...]
+ *       },
+ *       "auto_filters": [                // present only when `autoFacet:true`
+ *         {"field":"culoare","value":"Portocaliu"}
+ *       ],
+ *       "facet_labels": {                // human-readable names per field
+ *         "tip_de_protectie": "Tip de protectie"
+ *       },
  *       "diagnostics": { "took_ms": 12, "primary_hits": 5000, ... }
  *     }
  *
@@ -34,11 +44,19 @@ final class SearchResult
 
     /**
      * Cardinality of the match: how many documents *would* be returned
-     * if the page were unbounded. Distinct from `count(hits)` which is
-     * the page size capped by `limit`. Engine ships this as
-     * `count_estimate` because Tantivy returns an upper bound for very
-     * large segments — the value is exact for typical e-commerce
-     * catalogs (millions, not hundreds of millions).
+     * if the page were unbounded.
+     *
+     * **When `groupBy` is active**, this counts UNIQUE GROUPS, not raw
+     * variant documents — the right number to render "59 produse" on
+     * a variant-collapsed listing where each card represents one
+     * parent product but the index stores one document per
+     * size × color × ... combination.
+     *
+     * Distinct from `count(hits)` which is the page size capped by
+     * `limit`. Engine ships this as `count_estimate` because Tantivy
+     * returns an upper bound for very large segments — the value is
+     * exact for typical e-commerce catalogs (millions, not hundreds
+     * of millions).
      *
      * @readonly
      */
@@ -108,14 +126,95 @@ final class SearchResult
     public ?string $nextCursor;
 
     /**
-     * @param array<int, SearchHit> $hits           Relevance-ordered results (page only).
-     * @param int                   $total          Total matching documents across all pages.
-     * @param int                   $tookMs         Server-side query time.
-     * @param string                $query          Normalised query the engine actually ran.
-     * @param string|null           $suggestion     Did-you-mean; null when none.
-     * @param bool                  $autoCorrected  Whether the executed query is a correction.
-     * @param string                $qid            Per-search opaque id; '' when absent.
-     * @param string|null           $nextCursor     `search_after` token for the next page; null on the last.
+     * Facet aggregations — populated only when the search request
+     * asked for them via the `facets` option. Keys are the requested
+     * field names (engine identifiers); values are top-K bucket
+     * lists in `(count desc, value asc)` order, capped at 200 per
+     * field by the engine.
+     *
+     * Use {@see $facetLabels} to look up the human-readable display
+     * name for the engine identifier; fall back to the identifier
+     * itself when no label is registered.
+     *
+     *     // Render: "Marcă: Cofra (24), Renania (18), Malfini (7)"
+     *     foreach ($result->facets['marca'] ?? [] as $bucket) {
+     *         echo $bucket->value . ' (' . $bucket->count . ')';
+     *     }
+     *
+     * Empty array when no facets were requested OR the matching set
+     * was empty.
+     *
+     * @var array<string, array<int, FacetBucket>>
+     * @readonly
+     */
+    public array $facets;
+
+    /**
+     * Human-readable label per facet/sort field, sourced from the
+     * per-index column-label map (the original spreadsheet header).
+     * Maps engine identifier (`tip_de_protectie`) to display name
+     * (`"Tip de protectie"`).
+     *
+     *     $field = 'tip_de_protectie';
+     *     $label = $result->facetLabels[$field] ?? $field;
+     *
+     * Empty array when the index has no label registry (typical for
+     * indexes synced from JSON whose keys are already valid
+     * identifiers).
+     *
+     * @var array<string, string>
+     * @readonly
+     */
+    public array $facetLabels;
+
+    /**
+     * Filters the engine added IMPLICITLY when `autoFacet: true` was
+     * set on the request — query tokens that exactly matched known
+     * tag values get promoted to `tag_eq` filters and stripped from
+     * the BM25 query. Empty list when `autoFacet` was off or no
+     * match was found.
+     *
+     * Storefront UX: render as pre-checked chips so the operator
+     * understands "tricou portocaliu" became
+     * `q=tricou + culoare:Portocaliu` under the hood. Each entry
+     * exposes {@see AppliedFilter::toTagEqClause()} for promoting
+     * the auto-filter to an explicit one on the next request (e.g.
+     * after the user un-checks then re-applies it).
+     *
+     * @var array<int, AppliedFilter>
+     * @readonly
+     */
+    public array $autoFilters;
+
+    /**
+     * Which fallback mode the engine ran when the primary BM25 pass
+     * returned no hits. One of:
+     *
+     *   * `'strict'`  — same query, fuzzy match disabled (rare).
+     *   * `'phonetic'` — sound-alike retry (Romanian-tuned Soundex).
+     *   * `'union'`   — OR'd query tokens after AND failed.
+     *
+     * `null` when the primary pass had hits or fallback was
+     * disabled. Useful for a "Showing approximate matches" UI hint
+     * — phonetic / union results are deliberately broader.
+     *
+     * @readonly
+     */
+    public ?string $fallbackMode;
+
+    /**
+     * @param array<int, SearchHit>            $hits          Relevance-ordered results (page only).
+     * @param int                              $total         Total matching documents (or unique groups when grouped).
+     * @param int                              $tookMs        Server-side query time.
+     * @param string                           $query         Normalised query the engine actually ran.
+     * @param string|null                      $suggestion    Did-you-mean; null when none.
+     * @param bool                             $autoCorrected Whether the executed query is a correction.
+     * @param string                           $qid           Per-search opaque id; '' when absent.
+     * @param string|null                      $nextCursor    `search_after` token for the next page; null on the last.
+     * @param array<string, array<int, FacetBucket>> $facets        Bucket lists per requested facet field.
+     * @param array<string, string>            $facetLabels   Display names per engine field id.
+     * @param array<int, AppliedFilter>        $autoFilters   Implicitly-applied filters from `autoFacet`.
+     * @param string|null                      $fallbackMode  Fallback path that ran (or null).
      */
     public function __construct(
         array $hits,
@@ -125,7 +224,11 @@ final class SearchResult
         ?string $suggestion,
         bool $autoCorrected,
         string $qid,
-        ?string $nextCursor
+        ?string $nextCursor,
+        array $facets = [],
+        array $facetLabels = [],
+        array $autoFilters = [],
+        ?string $fallbackMode = null
     ) {
         $this->hits = $hits;
         $this->total = $total;
@@ -135,6 +238,10 @@ final class SearchResult
         $this->autoCorrected = $autoCorrected;
         $this->qid = $qid;
         $this->nextCursor = $nextCursor;
+        $this->facets = $facets;
+        $this->facetLabels = $facetLabels;
+        $this->autoFilters = $autoFilters;
+        $this->fallbackMode = $fallbackMode;
     }
 
     /**
@@ -172,6 +279,56 @@ final class SearchResult
             $nextCursor = $hits[count($hits) - 1]->cursor;
         }
 
+        // `facets`: { fieldName: [ {value, count}, ... ] }. Decode
+        // each bucket into a typed `FacetBucket`. Engine omits the
+        // whole map when no facets were requested OR when buckets
+        // are empty — default to an empty array so callers can
+        // unconditionally `foreach` without an isset guard.
+        $facets = [];
+        if (isset($raw['facets']) && is_array($raw['facets'])) {
+            foreach ($raw['facets'] as $field => $buckets) {
+                if (!is_string($field) || !is_array($buckets)) {
+                    continue;
+                }
+                $list = [];
+                foreach ($buckets as $b) {
+                    if (is_array($b)) {
+                        $list[] = FacetBucket::fromArray($b);
+                    }
+                }
+                $facets[$field] = $list;
+            }
+        }
+
+        // `facet_labels`: { engineId: "Display Name" }. Forward
+        // verbatim — typed as `array<string,string>` so consumers
+        // can `$labels[$id] ?? $id` it without conversion.
+        $facetLabels = [];
+        if (isset($raw['facet_labels']) && is_array($raw['facet_labels'])) {
+            foreach ($raw['facet_labels'] as $id => $label) {
+                if (is_string($id) && is_string($label)) {
+                    $facetLabels[$id] = $label;
+                }
+            }
+        }
+
+        // `auto_filters`: list of {field, value} for chips that the
+        // engine applied implicitly via `autoFacet`. Empty list when
+        // the option was off or no token matched.
+        $autoFilters = [];
+        if (isset($raw['auto_filters']) && is_array($raw['auto_filters'])) {
+            foreach ($raw['auto_filters'] as $entry) {
+                if (is_array($entry)) {
+                    $autoFilters[] = AppliedFilter::fromArray($entry);
+                }
+            }
+        }
+
+        $fallbackMode = null;
+        if (isset($raw['fallback_mode']) && is_string($raw['fallback_mode']) && $raw['fallback_mode'] !== '') {
+            $fallbackMode = $raw['fallback_mode'];
+        }
+
         return new self(
             $hits,
             (int) ($raw['count_estimate'] ?? count($hits)),
@@ -180,7 +337,11 @@ final class SearchResult
             is_string($suggestion) && $suggestion !== '' ? $suggestion : null,
             $autoCorrected,
             $qid,
-            $nextCursor
+            $nextCursor,
+            $facets,
+            $facetLabels,
+            $autoFilters,
+            $fallbackMode
         );
     }
 }

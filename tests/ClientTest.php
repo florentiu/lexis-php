@@ -833,4 +833,260 @@ final class ClientTest extends TestCase
             $url
         );
     }
+
+    public function testSearchForwardsSortGroupByFacetsAndBoost(): void
+    {
+        // The advanced options array gets translated into the wire
+        // shape the engine expects: camelCase → snake_case for
+        // `groupBy` → `group_by`, `autoFacet` → `auto_facet`. Each
+        // option ships only when set (so the wire stays lean for
+        // simple callers).
+        $this->transport->queue(200, [
+            'hits' => [],
+            'count_estimate' => 0,
+            'effective_query' => 'tricou',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
+        ]);
+
+        $this->client->search(
+            'products',
+            'tricou',
+            20,
+            0,
+            null,
+            null,
+            [
+                'sort' => [
+                    ['field' => 'pret', 'direction' => 'asc'],
+                ],
+                'groupBy' => 'parent_id',
+                'facets' => ['marca', 'culoare'],
+                'autoFacet' => true,
+                'boost' => [
+                    'field' => 'stoc',
+                    'function' => 'log',
+                    'weight' => 1.0,
+                ],
+                'prefixLast' => true,
+                'hybrid' => false,
+            ]
+        );
+
+        $body = json_decode($this->transport->calls[0]['body'], true);
+        $this->assertSame(
+            [['field' => 'pret', 'direction' => 'asc']],
+            $body['sort']
+        );
+        $this->assertSame('parent_id', $body['group_by']);
+        $this->assertSame(['marca', 'culoare'], $body['facets']);
+        $this->assertTrue($body['auto_facet']);
+        $this->assertSame('stoc', $body['boost']['field']);
+        $this->assertSame('log', $body['boost']['function']);
+        // PHP's json_encode emits 1.0 as `1` (integer), so it
+        // round-trips back as int. Cast for the comparison —
+        // engine accepts both anyway (serde coerces).
+        $this->assertEqualsWithDelta(1.0, (float) $body['boost']['weight'], 0.0001);
+        $this->assertTrue($body['options']['prefix_last']);
+        $this->assertFalse($body['options']['hybrid']);
+    }
+
+    public function testSearchOmitsOptionsWhenCallerDoesNotProvideAny(): void
+    {
+        // Backward compat: the legacy 6-arg signature must produce
+        // the exact same wire body it did in v0.2.x — no spurious
+        // `sort`, `group_by`, `facets`, etc. keys leaking onto
+        // requests that never asked for them.
+        $this->transport->queue(200, [
+            'hits' => [],
+            'count_estimate' => 0,
+            'effective_query' => 'x',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
+        ]);
+
+        $this->client->search('products', 'x');
+
+        $body = json_decode($this->transport->calls[0]['body'], true);
+        $this->assertArrayNotHasKey('sort', $body);
+        $this->assertArrayNotHasKey('group_by', $body);
+        $this->assertArrayNotHasKey('facets', $body);
+        $this->assertArrayNotHasKey('auto_facet', $body);
+        $this->assertArrayNotHasKey('boost', $body);
+        $this->assertArrayNotHasKey('options', $body);
+    }
+
+    public function testSearchExposesGroupedCountOnHit(): void
+    {
+        // When `groupBy: 'parent_id'` is active, each hit carries
+        // `grouped_count` = number of OTHER variants collapsed
+        // under it. Storefronts render this as "5 mărimi
+        // disponibile" or similar.
+        $this->transport->queue(200, [
+            'hits' => [
+                [
+                    'id' => 'sku-100-rosu-XL',
+                    'score' => 4.2,
+                    'payload' => ['parent_id' => '100', 'denumire_produs' => 'Tricou'],
+                    'grouped_count' => 4,
+                ],
+                [
+                    'id' => 'sku-200-albastru-S',
+                    'score' => 3.9,
+                    'payload' => ['parent_id' => '200', 'denumire_produs' => 'Bluza'],
+                    // grouped_count omitted → defaults to 0 (single-member group).
+                ],
+            ],
+            'count_estimate' => 2,
+            'effective_query' => 'tricou',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 2],
+        ]);
+
+        $result = $this->client->search('products', 'tricou');
+
+        $this->assertSame(4, $result->hits[0]->groupedCount);
+        $this->assertSame(0, $result->hits[1]->groupedCount);
+    }
+
+    public function testSearchExposesFacetsAndLabels(): void
+    {
+        // Facets shape: { fieldName: [ {value, count}, ... ] } in
+        // (count desc, value asc) order. `facet_labels` carries
+        // the original spreadsheet header for each engine identifier.
+        $this->transport->queue(200, [
+            'hits' => [],
+            'count_estimate' => 0,
+            'effective_query' => 'tricou',
+            'auto_corrected' => false,
+            'qid' => '',
+            'facets' => [
+                'marca' => [
+                    ['value' => 'Cofra', 'count' => 24],
+                    ['value' => 'Renania', 'count' => 18],
+                ],
+                'tip_de_protectie' => [
+                    ['value' => 'S1P', 'count' => 9],
+                ],
+            ],
+            'facet_labels' => [
+                'tip_de_protectie' => 'Tip de protectie',
+            ],
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
+        ]);
+
+        $result = $this->client->search('products', 'tricou', null, null, null, null, [
+            'facets' => ['marca', 'tip_de_protectie'],
+        ]);
+
+        $this->assertCount(2, $result->facets['marca']);
+        $this->assertSame('Cofra', $result->facets['marca'][0]->value);
+        $this->assertSame(24, $result->facets['marca'][0]->count);
+        $this->assertSame('Renania', $result->facets['marca'][1]->value);
+        $this->assertCount(1, $result->facets['tip_de_protectie']);
+        $this->assertSame('S1P', $result->facets['tip_de_protectie'][0]->value);
+        $this->assertSame(9, $result->facets['tip_de_protectie'][0]->count);
+        // Label fallback: present when registered, identifier
+        // otherwise.
+        $this->assertSame('Tip de protectie', $result->facetLabels['tip_de_protectie']);
+        $this->assertArrayNotHasKey('marca', $result->facetLabels);
+    }
+
+    public function testSearchExposesAutoFiltersAsTypedChips(): void
+    {
+        // With `autoFacet: true` the engine surfaces the implicit
+        // filters it applied — storefronts render these as
+        // pre-checked chips. Each entry exposes `toTagEqClause()`
+        // for promoting the auto-filter to an explicit one on the
+        // next request.
+        $this->transport->queue(200, [
+            'hits' => [],
+            'count_estimate' => 0,
+            'effective_query' => 'tricou',
+            'auto_corrected' => false,
+            'qid' => '',
+            'auto_filters' => [
+                ['field' => 'culoare', 'value' => 'Portocaliu'],
+            ],
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
+        ]);
+
+        $result = $this->client->search('products', 'tricou portocaliu', null, null, null, null, [
+            'autoFacet' => true,
+        ]);
+
+        $this->assertCount(1, $result->autoFilters);
+        $this->assertSame('culoare', $result->autoFilters[0]->field);
+        $this->assertSame('Portocaliu', $result->autoFilters[0]->value);
+        $this->assertSame(
+            ['op' => 'tag_eq', 'field' => 'culoare', 'value' => 'Portocaliu'],
+            $result->autoFilters[0]->toTagEqClause()
+        );
+    }
+
+    public function testSearchExposesFallbackMode(): void
+    {
+        // `fallback_mode` is set when the primary BM25 pass had no
+        // hits and the engine retried via phonetic / union /
+        // strict fallbacks. Storefronts use it to render
+        // "Showing approximate matches" hints — the broader the
+        // fallback, the looser the relevance.
+        $this->transport->queue(200, [
+            'hits' => [['id' => 'A', 'score' => 1.0, 'payload' => []]],
+            'count_estimate' => 1,
+            'effective_query' => 'mizajeur',
+            'auto_corrected' => false,
+            'fallback_mode' => 'phonetic',
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 4, 'primary_hits' => 0],
+        ]);
+
+        $result = $this->client->search('products', 'mizajeur');
+        $this->assertSame('phonetic', $result->fallbackMode);
+    }
+
+    public function testSearchFallbackModeNullByDefault(): void
+    {
+        $this->transport->queue(200, [
+            'hits' => [],
+            'count_estimate' => 0,
+            'effective_query' => 'x',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
+        ]);
+        $result = $this->client->search('products', 'x');
+        $this->assertNull($result->fallbackMode);
+    }
+
+    public function testSearchEmptyOptionsKeysSkippedNotForwardedAsNullsOrEmpty(): void
+    {
+        // Empty groupBy string should be treated as "not set" — we
+        // don't want to send `group_by: ""` and confuse the engine.
+        // Empty facets list / empty sort list ARE sent (empty array
+        // is a meaningful "use no facets / use no sort" signal,
+        // matching the engine's defaults).
+        $this->transport->queue(200, [
+            'hits' => [],
+            'count_estimate' => 0,
+            'effective_query' => 'x',
+            'auto_corrected' => false,
+            'qid' => '',
+            'diagnostics' => ['took_ms' => 1, 'primary_hits' => 0],
+        ]);
+
+        $this->client->search('products', 'x', null, null, null, null, [
+            'groupBy' => '',
+            'facets' => [],
+            'sort' => [],
+        ]);
+
+        $body = json_decode($this->transport->calls[0]['body'], true);
+        $this->assertArrayNotHasKey('group_by', $body);
+        $this->assertSame([], $body['facets']);
+        $this->assertSame([], $body['sort']);
+    }
 }

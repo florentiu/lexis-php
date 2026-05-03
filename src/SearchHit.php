@@ -13,17 +13,23 @@ namespace Lexis;
  *       "id": "sku-1",
  *       "score": 4.2,
  *       "payload": { "title": "Adidași Nike Air", "price": 349 },
- *       "cursor": "eyJvZmZzZXQiOjksImxhc3RfaWQiOiIxMDQ4MCJ9"
+ *       "cursor": "eyJvZmZzZXQiOjksImxhc3RfaWQiOiIxMDQ4MCJ9",
+ *       "grouped_count": 4
  *     }
  *
  *   * `id` is the document's primary key as a string (regardless of whether
  *     the field was numeric or string in the source — the engine canonicalizes).
- *   * `score` is BM25 (or the RRF-fused score on hybrid runs).
+ *   * `score` is BM25 (or the RRF-fused score on hybrid runs, or the sort
+ *     value re-packed into the score slot when an explicit `sort` was used).
  *   * `payload` is everything the caller originally pushed; we expose it as
  *     `$hit->document` and as a typed accessor `$hit->get('field')`.
  *   * `cursor` is an opaque base64 token used for `search_after` deep
  *     pagination — only present on hits where pagination can resume from
  *     this row. The last row of the last page has no cursor.
+ *   * `grouped_count` is the number of OTHER variants collapsed under this
+ *     row when {@see SearchRequest::group_by} was set. `0` when grouping is
+ *     off OR when the group has a single member. Use it to render
+ *     "+5 variante" badges on a variant-collapsed product card.
  */
 final class SearchHit
 {
@@ -51,9 +57,24 @@ final class SearchHit
     public ?string $cursor;
 
     /**
+     * Number of OTHER documents collapsed under this hit when
+     * `groupBy` was set on the search call. `0` when grouping is
+     * off, when the group has only one member, or for engines that
+     * predate the variant-grouping feature.
+     *
+     * Storefront UIs typically display this as "+{$n} variante" or
+     * "5 mărimi disponibile" on the product card. Add 1 if you need
+     * the total member count (representative + siblings).
+     *
+     * @readonly
+     */
+    public int $groupedCount;
+
+    /**
      * @param array<string, mixed> $raw The full JSON object for this hit.
      *                                   Expected keys: `id`, `score`,
-     *                                   `payload`, optional `cursor`.
+     *                                   `payload`, optional `cursor`,
+     *                                   optional `grouped_count`.
      */
     public function __construct(array $raw)
     {
@@ -63,6 +84,12 @@ final class SearchHit
         $this->document = is_array($payload) ? $payload : [];
         $cursor = $raw['cursor'] ?? null;
         $this->cursor = is_string($cursor) && $cursor !== '' ? $cursor : null;
+        // `grouped_count` is omitted on the wire when zero (engine
+        // uses `skip_serializing_if = is_zero_u32`). Default to 0
+        // here so callers can read the field unconditionally.
+        $this->groupedCount = isset($raw['grouped_count'])
+            ? (int) $raw['grouped_count']
+            : 0;
     }
 
     /**

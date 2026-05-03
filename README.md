@@ -156,29 +156,405 @@ $run = $lexis->sync->start('articles', 'Articles', 'slug');
 ## Search
 
 ```php
-// search(index, query, limit, offset, filters)
+// search(index, query, limit, offset, filters, searchAfter, options)
 $result = $lexis->search('products', 'adidași nike', 20, 0);
 ```
 
 Each hit carries the original document fields plus three synthetic ones —
-`id` (the primary-key value), `primaryKey`, and `score`:
+`id` (the primary-key value), `score`, and (when `groupBy` is on)
+`groupedCount`:
 
 ```php
 foreach ($result->hits as $hit) {
     $hit->id;                      // "sku-1"
-    $hit->primaryKey;              // "sku-1" (same; exposed for clarity)
     $hit->score;                   // 4.2
     $hit->get('title');            // "Adidași Nike Air"
     $hit->get('price', 0);         // 349 (with default if missing)
-    $hit->document;                // full associative array, clean of _ prefixes
+    $hit->document;                // full associative array
+    $hit->groupedCount;            // 0, or N siblings when groupBy is on
 }
 
-$result->total;                    // total matches across all pages
+$result->total;                    // total matches across all pages (or unique groups)
 $result->tookMs;                   // server-side query time
-$result->expandedTerms;            // ["adidas", "nike"] — stemmed/synonym-expanded
-$result->suggestion;               // "adidași" when the engine has a did-you-mean
-$result->qid;                      // "q_a8f4kx2j" — per-search id; '' on older engines
+$result->query;                    // engine-normalised effective query
+$result->autoCorrected;            // bool: engine retried with a corrected query
+$result->suggestion;               // "adidași" did-you-mean (or null)
+$result->fallbackMode;             // 'phonetic' / 'union' / 'strict' / null
+$result->qid;                      // "q_a8f4kx2j" — per-search id
+$result->facets;                   // array<string, FacetBucket[]>
+$result->facetLabels;              // array<string, string>
+$result->autoFilters;              // AppliedFilter[]
+$result->nextCursor;               // search_after token for the next page
 ```
+
+## Sort, grouping, facets, boost — `$options`
+
+The 7th argument to `search()` is an associative array of advanced
+features. Every key is optional; defaults match plain BM25 relevance.
+
+```php
+$result = $lexis->search(
+    'products',
+    'tricou rosu',
+    20,                                    // limit
+    0,                                     // offset
+    [['op' => 'tag_eq', 'field' => 'culoare', 'value' => 'Rosu']],  // filters
+    null,                                  // searchAfter
+    [                                      // options
+        'sort'      => [['field' => 'pret', 'direction' => 'asc']],
+        'groupBy'   => 'parent_id',
+        'facets'    => ['marca', 'culoare', 'marime'],
+        'autoFacet' => true,
+        'boost'     => ['field' => 'stoc', 'function' => 'log', 'weight' => 1.0],
+    ]
+);
+```
+
+### Sort
+
+`sort` overrides BM25 relevance with an explicit field sort. Three
+valid field shapes:
+
+| Use case            | Field kind                      | Example |
+|---------------------|---------------------------------|---------|
+| Price asc/desc      | `Numeric` + `sortable: true`    | `[{"field":"pret","direction":"asc"}]` |
+| Newest first        | `Tag` field that matches `groupBy` (typically `parent_id`) | `[{"field":"parent_id","direction":"desc"}]` |
+| Name A-Z / Z-A      | `Text` / `TextAndTag` + `groupBy` set | `[{"field":"denumire_produs","direction":"asc"}]` |
+
+For "newest", the engine parses the group key as a number, so `1000` >
+`999` (lex sort would rank them backwards). For text-field sort, the
+engine reads each group representative's payload and lex-sorts
+case-insensitive.
+
+```php
+// Price ascending
+'sort' => [['field' => 'pret', 'direction' => 'asc']],
+
+// Newest first (assumes parent_id is incrementing)
+'sort' => [['field' => 'parent_id', 'direction' => 'desc']],
+'groupBy' => 'parent_id',
+
+// Alphabetic by product name
+'sort' => [['field' => 'denumire_produs', 'direction' => 'asc']],
+'groupBy' => 'parent_id',
+```
+
+`sort` is mutually exclusive with `boost` (the engine returns 400 if
+you set both). The engine also bypasses hybrid (vector) when sort is
+set.
+
+### Variant grouping (`groupBy`)
+
+Catalogs that index one document per `size × color` should pass
+`groupBy: 'parent_id'` (or whatever your variant grouping field is
+called). The engine collapses all variants of the same parent into one
+hit, picks the best-scoring variant as the representative, and reports
+how many siblings were collapsed:
+
+```php
+'groupBy' => 'parent_id',
+
+// In the template:
+foreach ($result->hits as $hit) {
+    echo $hit->get('denumire_produs');
+    if ($hit->groupedCount > 0) {
+        echo " · " . ($hit->groupedCount + 1) . " variante";
+    }
+}
+```
+
+`$result->total` reports the count of **unique parents**, not raw
+variants — the right number for "59 produse" UX.
+
+Two constraints to keep in mind:
+
+  * The `groupBy` field MUST be declared as `kind: "Tag"` in the
+    index schema. Text fields don't have the dictionary fast column
+    the engine reads at collapse time.
+  * `searchAfter` is rejected when `groupBy` is on — use `offset`
+    pagination instead. (This rules out cursor-based deep walks
+    over a grouped catalog; in practice variant catalogs are small
+    enough by parent count that offset works fine.)
+
+### Facets — building the filter sidebar
+
+Pass `facets: ['marca', 'culoare', ...]` and the engine returns
+bucket counts per field, capped at 200 buckets per field, sorted
+`(count desc, value asc)`:
+
+```php
+'facets' => ['marca', 'culoare', 'marime'],
+```
+
+```php
+foreach ($result->facets as $field => $buckets) {
+    $label = $result->facetLabels[$field] ?? $field;
+    echo "<h4>{$label}</h4>";
+    foreach ($buckets as $bucket) {
+        $href = buildFilterHref($field, $bucket->value);
+        echo "<a href=\"{$href}\">{$bucket->value} ({$bucket->count})</a>";
+    }
+}
+```
+
+Notes:
+
+  * Each facet field must be declared `kind: "Tag"`. Numeric fields
+    don't work as facets in the MVP — for price, build your own
+    range sliders and send `numeric_range` filters.
+  * Buckets reflect the FILTERED set: a "Marcă" facet rendered next
+    to a `culoare:Rosu` filter shows only brands that have at least
+    one red variant. For "uncheck me to see other values" UX,
+    re-issue the search WITHOUT that field's filter when rendering
+    its facet column. (Yes, that's a second search per facet column;
+    in practice you only need it if your operators report missing
+    values.)
+  * `facetLabels` carries the original spreadsheet header (e.g.
+    `tip_de_protectie` → `"Tip de protectie"`). Fall back to the
+    identifier when no label is registered.
+
+### Auto-faceting — query categorisation
+
+Pass `autoFacet: true` to let the engine recognise tag values inside
+the query string and apply them as implicit `tag_eq` filters. "tricou
+portocaliu" → query becomes "tricou" + filter `culoare:Portocaliu`.
+
+```php
+'autoFacet' => true,
+```
+
+Each implicit filter surfaces in `$result->autoFilters`:
+
+```php
+foreach ($result->autoFilters as $auto) {
+    echo "Pre-checked: {$auto->field} = {$auto->value}";
+    // Promote to an explicit clause if the user toggles it:
+    $explicit = $auto->toTagEqClause();
+    // ['op' => 'tag_eq', 'field' => 'culoare', 'value' => 'Portocaliu']
+}
+```
+
+Storefront UX: render auto-filters as pre-checked chips in the filter
+sidebar so the operator understands "tricou portocaliu" became
+`q=tricou + culoare:Portocaliu` under the hood — and can un-toggle the
+chip if the detection was over-eager.
+
+Matching rules:
+
+  * Builds the vocabulary from ALL `tag` fields in the schema.
+  * Longest-phrase first: "Albastru Royal" wins over "Albastru".
+  * Token boundary only — facet value `"S"` doesn't match every
+    query containing the letter "s".
+  * Stacks with explicit `filters` — auto-applied on top, never
+    replaces what the caller sent.
+  * Idempotent: an explicit filter with the same `(field, value)` is
+    detected and not duplicated.
+
+### Numeric boost — stock-aware ranking
+
+`boost` multiplies BM25 by `1 + weight × f(value)` where `f` is `log`
+(default — diminishing returns, safe for unbounded fields like `stoc`)
+or `linear` (use only for bounded fields like a 0..1 popularity
+quantile).
+
+```php
+'boost' => [
+    'field'    => 'stoc',
+    'function' => 'log',     // 'log' (default) or 'linear'
+    'weight'   => 1.0,       // 1.0 default — tune per catalog
+],
+```
+
+The classic e-commerce use case: in-stock variants outrank out-of-
+stock peers without dominating relevance. With `function: 'log'` and
+the default weight, `log10(1+0) = 0` keeps zero-stock hits at their
+BM25 score while in-stock variants get a smooth lift.
+
+Constraints:
+
+  * Field must be `kind: "Numeric"` AND `sortable: true`.
+  * Mutually exclusive with `sort` — the engine returns 400 if both
+    are set. (Sort overrides BM25; multiplying the sort key is
+    meaningless.)
+  * Hybrid bypasses to BM25-only when boost is set.
+
+### Autocomplete — `prefixLast`
+
+Treat the last query token as a prefix. "adi" matches "adidași". Use
+this on autocomplete dropdowns where the user is mid-typing.
+
+```php
+'prefixLast' => true,
+```
+
+Pair with a low `limit` (5–10) and avoid grouping/facets — autocomplete
+budgets are tight.
+
+## Building a filter page (end-to-end)
+
+Storefront filter pages combine a half-dozen of the features above. The
+recommended pattern is **one search per render** — every piece of UI
+state (filters, sort, page, group, facets) goes into a single
+`search()` call. The engine returns hits, facets, and auto-filters in
+one round-trip.
+
+```php
+// 1. Parse URL state — single source of truth.
+$q     = trim($_GET['q'] ?? '');
+$sort  = $_GET['sort']  ?? 'relevance';   // 'relevance'|'price_asc'|'price_desc'|'name_asc'|'name_desc'|'newest'
+$page  = max(1, (int) ($_GET['page'] ?? 1));
+$limit = 20;
+$offset = ($page - 1) * $limit;
+
+$selectedFilters = [];
+foreach (['marca', 'culoare', 'marime'] as $field) {
+    if (!empty($_GET[$field])) {
+        $values = is_array($_GET[$field])
+            ? $_GET[$field]
+            : explode(',', $_GET[$field]);
+        $selectedFilters[] = count($values) === 1
+            ? ['op' => 'tag_eq', 'field' => $field, 'value' => $values[0]]
+            : ['op' => 'tag_in', 'field' => $field, 'values' => $values];
+    }
+}
+if (!empty($_GET['min_pret']) || !empty($_GET['max_pret'])) {
+    $selectedFilters[] = [
+        'op'    => 'numeric_range',
+        'field' => 'pret',
+        'min'   => isset($_GET['min_pret']) ? (float) $_GET['min_pret'] : null,
+        'max'   => isset($_GET['max_pret']) ? (float) $_GET['max_pret'] : null,
+    ];
+}
+
+// 2. Map UI sort mode to engine sort spec.
+$sortSpecs = [
+    'relevance'  => null,
+    'price_asc'  => [['field' => 'pret',            'direction' => 'asc']],
+    'price_desc' => [['field' => 'pret',            'direction' => 'desc']],
+    'name_asc'   => [['field' => 'denumire_produs', 'direction' => 'asc']],
+    'name_desc'  => [['field' => 'denumire_produs', 'direction' => 'desc']],
+    'newest'     => [['field' => 'parent_id',       'direction' => 'desc']],
+];
+
+// 3. ONE search — hits + facets + auto-filters in one round-trip.
+$options = [
+    'groupBy'   => 'parent_id',
+    'facets'    => ['marca', 'culoare', 'marime'],
+    'autoFacet' => true,
+];
+if ($sortSpecs[$sort] !== null) {
+    $options['sort'] = $sortSpecs[$sort];
+} else {
+    // Boost is mutually exclusive with sort — use it only on
+    // relevance mode where BM25 is the base.
+    $options['boost'] = ['field' => 'stoc', 'function' => 'log', 'weight' => 1.0];
+}
+
+$result = $lexis->search(
+    'products',
+    $q !== '' ? $q : '*',
+    $limit,
+    $offset,
+    $selectedFilters,
+    null,
+    $options
+);
+
+// 4. Render the filter sidebar from $result->facets.
+foreach ($result->facets as $field => $buckets) {
+    $label = $result->facetLabels[$field] ?? $field;
+    // <h4>$label</h4>
+    foreach ($buckets as $bucket) {
+        // Toggle this (field, value) on the URL so the same
+        // request shape works whether it's checked or unchecked.
+        $href = currentUrlWithFilterToggled($field, $bucket->value);
+        $checked = in_array($bucket->value, $_GET[$field] ?? [], true);
+        // <a href="$href" class="@if($checked) selected @endif">
+        //   $bucket->value ($bucket->count)
+        // </a>
+    }
+}
+
+// 5. Render auto-filter chips with an "x" link to remove.
+foreach ($result->autoFilters as $auto) {
+    // <span class="chip">$auto->field: $auto->value
+    //   <a href="?q={$strippedQuery}">×</a>
+    // </span>
+}
+
+// 6. Render product cards.
+foreach ($result->hits as $hit) {
+    $href = $lexis->withQid("/produse/{$hit->id}", $result->qid);
+    // <a href="$href">
+    //   <img src="{$hit->get('imagine')}">
+    //   <h3>{$hit->get('denumire_produs')}</h3>
+    //   <p>{$hit->get('pret')} lei</p>
+    //   @if ($hit->groupedCount > 0)
+    //     <span>{($hit->groupedCount + 1)} variante</span>
+    //   @endif
+    // </a>
+}
+
+// 7. Pagination.
+$totalPages = max(1, (int) ceil($result->total / $limit));
+// Render page links — &page=1, &page=2, ...
+
+// 8. Track the page-view event (best effort).
+try {
+    $lexis->recordView(
+        'search',
+        \Lexis\Client::detectSource(
+            $_SERVER['HTTP_REFERER'] ?? null,
+            $_SERVER['HTTP_HOST'] ?? null,
+        ),
+        null,
+        null,
+        $_SERVER['HTTP_REFERER'] ?? null,
+        $_SERVER['REQUEST_URI'] ?? null,
+        null,
+    );
+} catch (\Lexis\Exception\LexisException $e) {
+    error_log('lexis view tracking: ' . $e->getMessage());
+}
+```
+
+A complete runnable example lives at
+`examples/storefront-with-filters.php`.
+
+### Index schema requirements
+
+The index `mappings` must declare the right field kinds for each
+feature. The dashboard's "Settings → Index schema" page does this; if
+you build the schema by hand, the relevant entries:
+
+```json
+{
+  "mappings": [
+    { "name": "denumire_produs", "kind": "TextAndTag", "facetable": true },
+    { "name": "pret",            "kind": "Numeric",    "sortable": true },
+    { "name": "stoc",            "kind": "Numeric",    "sortable": true },
+    { "name": "parent_id",       "kind": "Tag" },
+    { "name": "marca",           "kind": "Tag",        "facetable": true },
+    { "name": "culoare",         "kind": "Tag",        "facetable": true },
+    { "name": "marime",          "kind": "Tag",        "facetable": true }
+  ]
+}
+```
+
+| Feature                    | Required mapping kind                  | Required flags        |
+|----------------------------|----------------------------------------|-----------------------|
+| `sort` (numeric)           | `Numeric`                              | `sortable: true`      |
+| `sort` (parent_id)         | `Tag` matching `groupBy`               | —                     |
+| `sort` (text/name)         | `Text` or `TextAndTag` + `groupBy` set | —                     |
+| `groupBy`                  | `Tag`                                  | —                     |
+| `facets`                   | `Tag`                                  | (`facetable: true` informational) |
+| `autoFacet`                | `Tag` (any tag field qualifies)        | —                     |
+| `boost`                    | `Numeric`                              | `sortable: true`      |
+| filter `tag_eq` / `tag_in` | `Tag` or `TextAndTag`                  | —                     |
+| filter `numeric_range`     | `Numeric`                              | —                     |
+
+Using a feature against a field declared with the wrong kind returns
+a `ValidationException` (HTTP 400) from the engine.
 
 ## Click attribution
 
