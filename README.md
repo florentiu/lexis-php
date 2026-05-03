@@ -153,6 +153,273 @@ ignored thereafter.
 $run = $lexis->sync->start('articles', 'Articles', 'slug');
 ```
 
+## Syncing variant catalogs
+
+Variant catalogs (one product line, many size × color × ... combinations)
+need a deliberate decision **before** you start syncing from PHP: do you
+want the engine to explode parent rows into variant rows on the way in,
+or do you want to pre-explode in PHP and skip the explosion path?
+
+The two strategies have the same `groupBy: 'parent_id'` search behavior
+but very different sync code on your side. Pick one and stick with it
+per index — switching mid-stream means re-syncing the whole catalog.
+
+### Background: how variant explosion works
+
+Some indexes have a `variant_template` configured (visible in the
+dashboard at **Settings → Variants** or in the index config). When set,
+every document the engine receives via `/api/v1/sync/*/documents` runs
+through `explode_doc(parent, template)` server-side: the engine reads a
+named blob column on the doc, parses it, and emits one document per
+variant.
+
+The default Renania-style template:
+
+```
+source_column      = "combinatii_marime-culoare-pret-stoc"
+parent_id_field    = "parent_id"
+size_field         = "marime"
+color_field        = "culoare"
+price_field        = "pret"
+stock_field        = "stoc"
+```
+
+Engine behavior on each incoming doc:
+
+  * **`source_column` populated with a parseable blob** → emits N
+    variant docs, one per segment, with PK `<parent_pk>__<idx>`.
+  * **`source_column` missing or empty** → emits one placeholder doc
+    with `stoc=0` so the parent still surfaces in search. This is
+    what bites people who push raw DB rows: 11k rows in, 11k
+    placeholders out — no explosion, every product looks
+    out-of-stock.
+
+You can verify what your index expects by reading its config:
+
+```bash
+curl -sS -H "Authorization: Bearer $LEXIS_API_KEY" \
+  "https://lexis.software/v1/admin/orgs/{ORG_ID}/indexes/{INDEX_SLUG}" \
+  | jq '.config.variant_template'
+```
+
+If the response is `null`, your index has no template — you're on
+**Strategy B** territory and the engine will index whatever you push
+verbatim. If you see a template, you're on **Strategy A** and need to
+respect the blob shape, OR remove the template (Settings → Variants →
+disable) and migrate to Strategy B.
+
+### The blob format
+
+When `variant_template` is configured, each parent document must carry
+a string under `source_column` shaped like:
+
+```
+size :: color :: price :: stock | size :: color :: price :: stock | ...
+```
+
+  * **Pipe (`|`)** separates variants.
+  * **Double-colon (`::`)** separates the four slots inside one
+    variant. (A legacy ` - ` separator is also accepted for older
+    spreadsheets — pick one and stick with it.)
+  * **Slot order is positional**: `size :: color :: price :: stock`.
+    Always 4 slots. A missing field stays as a literal `null`
+    placeholder, NOT empty:
+
+```
+XL :: Rosu :: 49 RON :: 12 | XL :: Albastru :: 49 RON :: 8 | M :: null :: 49 RON :: 5
+```
+
+  * **Price slot** accepts any of `RON`, `EUR`, `USD`, `GBP`, `MDL`,
+    `BGN` (configurable per template via `price_labels`).
+  * **Stock slot** is an integer; `0` means out-of-stock. A
+    non-integer becomes `0`.
+  * **Whitespace around the separators is tolerated** — both
+    `XL::Rosu::49 RON::12` and `XL :: Rosu :: 49 RON :: 12` parse
+    identically.
+
+### Strategy A — PHP builds the variant blob
+
+Use this when your index already has `variant_template` configured
+(typical: you've been importing via the dashboard's Excel uploader and
+want to keep that schema). Your PHP script reads per-variant rows from
+the DB, groups them by parent, and assembles the blob before pushing.
+
+```php
+$run = $lexis->sync->start('renania-b2c-romana');
+
+// Source: per-variant rows ordered by parent_id so we can stream-group
+// without holding the whole catalog in memory.
+$stmt = $pdo->query("
+    SELECT parent_id, denumire_produs, marca, descriere, imagine, url,
+           marime, culoare, pret, stoc
+    FROM produse
+    ORDER BY parent_id
+");
+
+$current = null;
+$variantParts = [];
+$batch = [];
+
+$flushParent = function () use (&$current, &$variantParts, &$batch, $run): void {
+    if ($current === null) return;
+
+    // Build the engine-expected blob: size :: color :: price :: stock,
+    // pipe-joined across variants. Use 'null' (literal string) for
+    // missing size/color so the engine's positional parser keeps the
+    // 4-slot layout.
+    $blob = implode(' | ', array_map(static function (array $v): string {
+        $size  = $v['marime']  !== null && $v['marime']  !== '' ? $v['marime']  : 'null';
+        $color = $v['culoare'] !== null && $v['culoare'] !== '' ? $v['culoare'] : 'null';
+        $price = $v['pret']    !== null ? sprintf('%.2f RON', (float) $v['pret']) : 'null';
+        $stock = $v['stoc']    !== null ? (int) $v['stoc'] : 0;
+        return "{$size} :: {$color} :: {$price} :: {$stock}";
+    }, $variantParts));
+
+    $batch[] = [
+        'id'                                  => (string) $current['parent_id'],
+        'parent_id'                           => (string) $current['parent_id'],
+        'denumire_produs'                     => $current['denumire_produs'],
+        'marca'                               => $current['marca'],
+        'descriere'                           => $current['descriere'],
+        'imagine'                             => $current['imagine'],
+        'url'                                 => $current['url'],
+        // The blob — column name must match `source_column` from the
+        // index's variant_template exactly.
+        'combinatii_marime-culoare-pret-stoc' => $blob,
+    ];
+
+    if (count($batch) >= 500) {
+        $run->push($batch);
+        $batch = [];
+    }
+};
+
+while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+    if ($current !== null && $current['parent_id'] !== $row['parent_id']) {
+        $flushParent();
+        $variantParts = [];
+    }
+    $current = $row;
+    $variantParts[] = $row;
+}
+$flushParent();
+if ($batch !== []) {
+    $run->push($batch);
+}
+
+$stats = $run->commit();
+echo "OK: {$stats['documents']} variants indexed\n";
+```
+
+**Result on the engine side**: each parent row explodes into N variant
+rows; the index ends up holding the variant total. With 100 parent
+products averaging 110 variants you'd push 100 docs and the engine
+indexes ~11,000.
+
+### Strategy B — PHP pushes pre-exploded variant rows
+
+Use this when you want to keep PHP simple (no blob assembly) and own
+the variant shape end-to-end. Requires the index to have **NO**
+`variant_template` configured — disable it via Settings → Variants in
+the dashboard, or recreate the index without one.
+
+Each row you push is one variant. The dashboard's variant template is
+off, so the engine indexes verbatim. You give each variant a unique PK
+(typically `parent_id__variant_idx`) and copy the parent fields onto
+every row so the variant is independently searchable.
+
+```php
+$run = $lexis->sync->start('renania-b2c-romana');
+
+$batch = [];
+foreach (fetchVariantsFromDb() as $row) {
+    $batch[] = [
+        // Unique per-variant PK — guarantees idempotent re-syncs and
+        // gives groupBy something distinct to collapse.
+        'id'              => "{$row['parent_id']}__{$row['variant_idx']}",
+        // The grouping key — this becomes `groupBy: 'parent_id'` at
+        // search time so the storefront sees one card per product.
+        'parent_id'       => (string) $row['parent_id'],
+        // Parent fields copied onto every variant row.
+        'denumire_produs' => $row['denumire_produs'],
+        'marca'           => $row['marca'],
+        'descriere'       => $row['descriere'],
+        'imagine'         => $row['imagine'],
+        'url'             => $row['url'],
+        // Per-variant fields — directly indexable, filterable.
+        'marime'          => $row['marime'],
+        'culoare'         => $row['culoare'],
+        'pret'            => (float) $row['pret'],
+        'stoc'            => (int) $row['stoc'],
+    ];
+    if (count($batch) >= 500) {
+        $run->push($batch);
+        $batch = [];
+    }
+}
+if ($batch !== []) {
+    $run->push($batch);
+}
+
+$stats = $run->commit();
+echo "OK: {$stats['documents']} variants indexed\n";
+```
+
+**Result**: 11k DB rows in → 11k engine docs. Search returns one card
+per `parent_id` thanks to `groupBy: 'parent_id'`. Index is bigger
+than Strategy A because parent fields are duplicated on every variant
+— for typical e-com catalogs (under 1M variants) this is irrelevant,
+disk is cheap.
+
+### Choosing between the two
+
+| Aspect                               | Strategy A — engine explodes | Strategy B — PHP pre-explodes |
+|--------------------------------------|-------------------------------|--------------------------------|
+| `variant_template` on the index      | Required                      | Must NOT be set                |
+| PHP code complexity                  | Higher (group by parent + blob assembly) | Lower (1 row in DB = 1 row out) |
+| Bandwidth on `push()`                | Lower (sends 100 parent rows) | Higher (sends 11k rows)        |
+| Index disk size                      | Smaller (engine deduplicates parent fields internally) | Larger (parent fields copied per variant) |
+| Source-of-truth coupling             | Blob format is engine-defined (legacy / new separator, price labels) | You own the schema entirely |
+| Migration effort                     | Match what the dashboard's Excel import already produces | Set up the schema once, push raw DB rows forever |
+| Search behavior                      | Same — `groupBy: 'parent_id'` collapses on both | Same |
+
+**Rule of thumb**: if your data already lives one-row-per-variant in
+the DB (typical), pick **Strategy B** — it removes a moving piece.
+Pick **Strategy A** only if the dashboard's Excel-driven import is
+already in production and you're swapping it for a script that has to
+produce identical data on the engine side without touching the index
+config.
+
+### Common pitfall: "I push N docs and N docs land"
+
+The single most common bug when migrating from dashboard imports to
+SDK pushes:
+
+  * Index has `variant_template` configured (from earlier dashboard
+    use).
+  * PHP script sends per-variant rows from the DB without the blob
+    column, OR sends parent rows without the blob.
+  * Engine sees no `source_column` populated → emits ONE placeholder
+    per row with `stoc=0` → product count looks roughly right but
+    every variant collapses to "out of stock" and search relevance
+    is broken because there's no per-variant size/color/price.
+
+Diagnostic:
+
+```php
+$result = $lexis->search('renania-b2c-romana', 'tricou', 1, 0, null, null, [
+    'groupBy' => 'parent_id',
+]);
+foreach ($result->hits as $hit) {
+    var_dump($hit->document['marime']);  // null = explosion didn't fire
+    var_dump($hit->document['stoc']);    // 0 = placeholder, not real variant
+    echo "Total = {$result->total}\n";   // unique parents
+}
+```
+
+Fix: either add the blob column (Strategy A) or disable
+`variant_template` on the index (Strategy B).
+
 ## Search
 
 ```php

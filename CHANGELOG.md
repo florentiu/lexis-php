@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.3.1 — variant catalog sync docs in README
+
+The README that Packagist surfaces (and that every developer reads
+first when they `composer require lexis/lexis-php`) had no mention
+of how to sync VARIANT catalogs (size × color × ... per product).
+v0.3.0 documented how to *search* variants — `groupBy: 'parent_id'`,
+`$hit->groupedCount`, sorts that work with grouping — but said
+nothing about what shape data has to land in to produce those
+variants. Anyone migrating from the dashboard's Excel import to a
+direct SDK sync would push raw DB rows, see N docs in / N docs
+out, and get one out-of-stock placeholder per parent.
+
+Docs-only fix:
+
+  * Adds a "Syncing variant catalogs" section between "Sync flow
+    in detail" and "Search" with: background on `variant_template`
+    and engine-side `explode_doc`, the exact blob format
+    (`size :: color :: price :: stock | ...`), how to verify the
+    template via `curl ... | jq .config.variant_template`, two
+    full strategies (PHP builds the blob vs. PHP pre-explodes),
+    a comparison table for picking between them, and a "Common
+    pitfall" box with a diagnostic snippet for the
+    "N docs in / N docs out" bug.
+
+No code changes. v0.3.0 callers keep working without any update —
+this release is purely a documentation correctness fix so Packagist
+readers see how variant sync actually works end-to-end.
+
 ## v0.3.0 — sort, grouping, facets, auto-faceting, boost
 
 Big release that turns `Client::search()` from a flat full-text search
