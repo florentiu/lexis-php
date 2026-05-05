@@ -648,6 +648,98 @@ final class Client
      * @param int|null $toMs       Window end, ms-since-epoch. Defaults to now.
      * @param int|null $limit      Top-N rows in the response (default 50, max 200).
      */
+    /**
+     * Pull the per-query rollup the engine builds from search events.
+     *
+     * Each row carries TWO complementary readings of the same event log:
+     * `searches` (raw event count — every `/v1/search` call) and
+     * `uniqueSearches` (dedup'd by `(session_proxy, hour_bucket)` so the
+     * same shopper hitting back twice on the same query within an hour
+     * collapses to one). See {@see TopQuery} for the full metric
+     * semantics; in short, `uniqueSearches` is the "people-searched-this"
+     * metric to headline, `searches` is the engine-load metric.
+     *
+     * Lives on the admin tier (same as `getClickAttribution()`) — pass
+     * the org id you got from the dashboard / CLI. The session-style
+     * bearer (or an admin-scoped API key) is the same one the rest of
+     * the SDK uses.
+     *
+     * @param string      $orgId    Org id (the dashboard shows this on the org page).
+     * @param int|null    $fromMs   Window start, ms-since-epoch. Engine defaults to now-90d.
+     * @param int|null    $toMs     Window end, ms-since-epoch. Engine defaults to now.
+     * @param int|null    $limit    Top-N rows in the response (engine default 50, max 200).
+     * @return array<int, TopQuery> Rows sorted by `searches` desc.
+     */
+    public function getTopQueries(
+        string $orgId,
+        ?int $fromMs = null,
+        ?int $toMs = null,
+        ?int $limit = null
+    ): array {
+        $query = [];
+        if ($fromMs !== null) {
+            $query['from_ms'] = $fromMs;
+        }
+        if ($toMs !== null) {
+            $query['to_ms'] = $toMs;
+        }
+        if ($limit !== null) {
+            $query['limit'] = $limit;
+        }
+        $path = '/v1/admin/orgs/' . rawurlencode($orgId) . '/analytics/top-queries';
+        if (!empty($query)) {
+            $path .= '?' . http_build_query($query);
+        }
+        $data = $this->request('GET', $path, null);
+        $rowsRaw = isset($data['queries']) && is_array($data['queries'])
+            ? $data['queries']
+            : [];
+        $out = [];
+        foreach ($rowsRaw as $row) {
+            if (is_array($row)) {
+                $out[] = TopQuery::fromArray($row);
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Drill down from one search id (`qid`) to the products the shopper
+     * clicked. Powers per-search "what did the user click?" surfaces
+     * — given the qid stamped on a {@see SearchResult}, returns every
+     * click attributed to that exact search, oldest first.
+     *
+     * Empty array (not an exception) when the search had no attributed
+     * clicks — the common case, since most searches don't get clicked.
+     * Cheaper than `getClickAttribution()` when the operator already
+     * knows the specific search id they want to expand.
+     *
+     * Requires engine 0.7.10 or newer; older engines return 404 here.
+     *
+     * @param string $orgId Org id (the dashboard shows this on the org page).
+     * @param string $qid   Per-search id minted on `SearchResult::$qid`.
+     * @return array<int, Click> Clicks sorted by `createdAtMs` asc (oldest first).
+     */
+    public function getClicksForEvent(string $orgId, string $qid): array
+    {
+        $path = '/v1/admin/orgs/'
+            . rawurlencode($orgId)
+            . '/events/'
+            . rawurlencode($qid)
+            . '/clicks';
+        $data = $this->request('GET', $path, null);
+        $rowsRaw = isset($data['clicks']) && is_array($data['clicks'])
+            ? $data['clicks']
+            : [];
+        $out = [];
+        foreach ($rowsRaw as $row) {
+            if (is_array($row)) {
+                $out[] = Click::fromArray($row);
+            }
+        }
+        return $out;
+    }
+
     public function getClickAttribution(
         string $orgId,
         ?string $indexSlug = null,

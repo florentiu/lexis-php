@@ -908,6 +908,70 @@ foreach ($rep->zeroClickQueries as $row) {
 A complete end-to-end script (search → result links → product page →
 rollup) lives at `examples/storefront-with-click-attribution.php`.
 
+### Per-search drilldown — `getClicksForEvent()`
+
+`getClickAttribution()` rolls up the whole window into KPIs and per-
+query slices. Sometimes you want the opposite: given **one** search,
+which products did the shopper actually click? The dashboard's
+`/logs` page uses this to expand a row into a list of attributed
+clicks; you can call the same endpoint from PHP if you want to
+surface "what did the user pick" inline next to a search log entry.
+
+```php
+$result = $lexis->search('products', 'manusi');
+// …time passes, the customer clicks something, the click is recorded…
+
+// later, in admin tooling:
+$clicks = $lexis->getClicksForEvent($orgId, $result->qid);
+// $clicks: Lexis\Click[] — oldest first
+foreach ($clicks as $c) {
+    printf("%s  pos=%s  %s\n",
+        $c->productId,
+        $c->position ?? '—',
+        $c->landingUrl ?? '');
+}
+```
+
+The empty case (search with no attributed clicks) returns `[]`, not
+an exception — most searches don't get clicked, that's normal.
+Cheaper than `getClickAttribution()` when you already know the
+specific search row to expand. Requires engine 0.7.10 or newer.
+
+### Top queries — `getTopQueries()`
+
+If you're building a "top searches" widget on your own admin (or
+embedding Lexis analytics into a customer's CMS), `getTopQueries()`
+returns the per-query rollup the engine builds from the event log:
+
+```php
+$rows = $lexis->getTopQueries($orgId, null, null, 20);
+foreach ($rows as $row) {
+    // $row: Lexis\TopQuery
+    printf("%s: %d unique (%d raw events)\n",
+        $row->query, $row->uniqueSearches, $row->searches);
+}
+```
+
+Each row carries TWO complementary readings of the same event log:
+
+- `$row->searches` — raw event count, every `/v1/search` call counts.
+  Inflated by storefront back-button re-fetches and pagination —
+  useful as a **load** metric.
+- `$row->uniqueSearches` — dedup'd by `(session_proxy, hour_bucket)`
+  server-side. Same shopper hitting back twice on the same query
+  within an hour collapses to one. The **intent** metric to
+  headline ahead of the raw count.
+
+Session proxy fallback chain (engine-side): the storefront-supplied
+session id (forward via `setSessionId()` or `X-Lexis-Session-Id`),
+falling back to the client IP, falling back to per-event uniqueness
+so anonymous traffic without either signal degrades to raw counting
+rather than collapsing into a single bucket.
+
+Pre-engine-0.7.9 builds don't return `unique_searches`; the SDK
+falls back to mirroring `searches` so callers comparing the two
+see equality ("no dedup applied") rather than a phantom zero.
+
 ## Page-view tracking
 
 Click attribution answers "what does a user do **after** they search".

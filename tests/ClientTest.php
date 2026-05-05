@@ -661,6 +661,172 @@ final class ClientTest extends TestCase
         $this->assertStringContainsString('limit=50', $call['url']);
     }
 
+    public function testGetTopQueriesDecodesResponseAndExposesUniqueSearches(): void
+    {
+        // Engine 0.7.9+ returns BOTH `searches` (raw event count) and
+        // `unique_searches` (dedup'd by `(session_proxy, hour_bucket)`).
+        // The SDK exposes both verbatim — callers pick which metric to
+        // display and the SDK doesn't editorialise.
+        $this->transport->queue(200, [
+            'queries' => [
+                [
+                    'query' => 'manusi',
+                    'searches' => 12,
+                    'unique_searches' => 4,
+                    'zero_result_searches' => 0,
+                    'avg_latency_ms' => 8,
+                    'last_seen_ms' => 1_700_086_400_000,
+                ],
+                [
+                    'query' => 'bocanci',
+                    'searches' => 5,
+                    'unique_searches' => 5,
+                    'zero_result_searches' => 0,
+                    'avg_latency_ms' => 10,
+                    'last_seen_ms' => 1_700_000_000_000,
+                ],
+            ],
+        ]);
+
+        $rows = $this->client->getTopQueries(
+            'org_acme',
+            1_700_000_000_000,
+            1_700_086_400_000,
+            10
+        );
+
+        $this->assertCount(2, $rows);
+        $this->assertSame('manusi', $rows[0]->query);
+        $this->assertSame(12, $rows[0]->searches);
+        $this->assertSame(4, $rows[0]->uniqueSearches);
+        $this->assertSame('bocanci', $rows[1]->query);
+        $this->assertSame(5, $rows[1]->uniqueSearches);
+
+        $call = $this->transport->calls[0];
+        $this->assertSame('GET', $call['method']);
+        $this->assertStringContainsString(
+            '/v1/admin/orgs/org_acme/analytics/top-queries',
+            $call['url']
+        );
+        $this->assertStringContainsString('from_ms=1700000000000', $call['url']);
+        $this->assertStringContainsString('limit=10', $call['url']);
+    }
+
+    public function testGetTopQueriesDefaultsUniqueToSearchesOnLegacyEngine(): void
+    {
+        // Pre-0.7.9 engines don't return `unique_searches` at all. The
+        // SDK falls back to mirroring `searches` so callers comparing
+        // the two see equality ("no dedup applied") rather than a
+        // phantom zero in the unique field.
+        $this->transport->queue(200, [
+            'queries' => [
+                [
+                    'query' => 'manusi',
+                    'searches' => 12,
+                    // unique_searches deliberately absent
+                    'zero_result_searches' => 0,
+                    'avg_latency_ms' => 8,
+                    'last_seen_ms' => 1_700_086_400_000,
+                ],
+            ],
+        ]);
+
+        $rows = $this->client->getTopQueries('org_acme');
+
+        $this->assertCount(1, $rows);
+        $this->assertSame(12, $rows[0]->searches);
+        $this->assertSame(
+            12,
+            $rows[0]->uniqueSearches,
+            'legacy engine without unique_searches should mirror searches, not return 0'
+        );
+    }
+
+    public function testGetClicksForEventDecodesResponse(): void
+    {
+        // Per-search drilldown: given the qid the engine stamped on a
+        // `SearchResult`, return every click attributed to that exact
+        // search. Field-by-field decode mirroring the engine's
+        // `ClickRow` shape; nullable fields stay null when the
+        // storefront didn't pass them on `recordClick()`.
+        $this->transport->queue(200, [
+            'clicks' => [
+                [
+                    'id' => 'click_1',
+                    'org_id' => 'org_acme',
+                    'index_slug' => 'products',
+                    'qid' => 'q_abc123',
+                    'product_id' => 'sku_42',
+                    'position' => 1,
+                    'landing_url' => 'https://example.com/p/sku_42',
+                    'api_key_id' => 'key_storefront',
+                    'created_at_ms' => 1_700_000_000_000,
+                    'session_id' => 'sess_xyz',
+                ],
+                [
+                    'id' => 'click_2',
+                    'org_id' => 'org_acme',
+                    'index_slug' => 'products',
+                    'qid' => 'q_abc123',
+                    'product_id' => 'sku_99',
+                    // position deliberately absent — storefront didn't track slot
+                    'landing_url' => null,
+                    'api_key_id' => null,
+                    'created_at_ms' => 1_700_000_001_000,
+                    'session_id' => null,
+                ],
+            ],
+        ]);
+
+        $rows = $this->client->getClicksForEvent('org_acme', 'q_abc123');
+
+        $this->assertCount(2, $rows);
+        $this->assertSame('sku_42', $rows[0]->productId);
+        $this->assertSame(1, $rows[0]->position);
+        $this->assertSame('https://example.com/p/sku_42', $rows[0]->landingUrl);
+        $this->assertSame('sess_xyz', $rows[0]->sessionId);
+        $this->assertSame('sku_99', $rows[1]->productId);
+        $this->assertNull($rows[1]->position);
+        $this->assertNull($rows[1]->landingUrl);
+        $this->assertNull($rows[1]->sessionId);
+
+        $call = $this->transport->calls[0];
+        $this->assertSame('GET', $call['method']);
+        $this->assertStringContainsString(
+            '/v1/admin/orgs/org_acme/events/q_abc123/clicks',
+            $call['url']
+        );
+    }
+
+    public function testGetClicksForEventReturnsEmptyArrayWhenNoClicks(): void
+    {
+        // The common case — a search the user issued but didn't click
+        // any result for. Empty array (not exception, not null) so
+        // callers `foreach` over it without a special branch.
+        $this->transport->queue(200, ['clicks' => []]);
+
+        $rows = $this->client->getClicksForEvent('org_acme', 'q_unused');
+
+        $this->assertSame([], $rows);
+    }
+
+    public function testGetClicksForEventEncodesQidWithUrlSafeChars(): void
+    {
+        // The engine mints qids as `q_<8 base62 chars>` so URL-safe in
+        // practice, but the SDK shouldn't trust input — `rawurlencode`
+        // makes the surface robust if a future qid format includes a
+        // slash or a plus.
+        $this->transport->queue(200, ['clicks' => []]);
+
+        $this->client->getClicksForEvent('org_acme', 'q with/slash');
+
+        $call = $this->transport->calls[0];
+        $this->assertStringContainsString(
+            '/events/q%20with%2Fslash/clicks',
+            $call['url']
+        );
+    }
+
     public function testSessionIdForwardedAsHeader(): void
     {
         // Setting the session id should forward it on every subsequent

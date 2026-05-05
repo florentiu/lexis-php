@@ -1,5 +1,92 @@
 # Changelog
 
+## v0.4.0 — top-queries (with unique-search dedup) + per-search click drilldown
+
+Two admin-tier methods land on `Client`, mirroring the existing
+`getClickAttribution()` pattern. Both back analytics surfaces a
+PHP storefront might want to render in its own admin (CTR
+widgets, top-search reports, "what did the user click?" pop-overs)
+without re-implementing the engine round-trip.
+
+### Backward compatibility
+
+**Non-breaking.** v0.3.x callers keep working without changes. Two
+new public classes (`Lexis\TopQuery`, `Lexis\Click`) and two new
+methods on `Lexis\Client`; nothing existing changed shape.
+
+### `Client::getTopQueries()`
+
+Calls `GET /v1/admin/orgs/:org/analytics/top-queries` and returns
+typed `TopQuery[]`. Each row carries TWO complementary readings
+of the same event log:
+
+- **`searches`** — raw event count, every `/v1/search` call counts.
+  Inflated by storefront back-button re-fetches and pagination.
+  Useful as an engine-load metric.
+- **`uniqueSearches`** — dedup'd by `(session_proxy, hour_bucket)`
+  server-side. Same shopper hitting back twice on the same query
+  within an hour collapses to one. The "people-searched-this"
+  metric to headline ahead of the raw count.
+
+Session proxy fallback chain (engine-side):
+`session_id` → `ip_address` → per-event uniqueness so anonymous
+traffic without either signal degrades to raw counting, NOT
+all-collapse-into-one-bucket.
+
+```php
+$rows = $client->getTopQueries('org_abc', null, null, 20);
+foreach ($rows as $row) {
+    printf("%s: %d unique (%d raw events)\n",
+        $row->query, $row->uniqueSearches, $row->searches);
+}
+```
+
+Pre-engine-0.7.9 builds don't return `unique_searches`; the SDK
+falls back to mirroring `searches` so existing callers comparing
+the two see equality ("no dedup applied") rather than a phantom
+zero.
+
+### `Client::getClicksForEvent($orgId, $qid)`
+
+Calls `GET /v1/admin/orgs/:org/events/:qid/clicks` and returns
+typed `Click[]`. Given a search id (the qid the engine stamps on
+every `SearchResult`), drill down to every product the shopper
+clicked attributed to that exact search — oldest first.
+
+```php
+$result = $client->search('products', 'manusi');
+// later, in admin tooling that wants per-search detail:
+$clicks = $client->getClicksForEvent('org_abc', $result->qid);
+// Click[]: productId, position?, landingUrl?, createdAtMs, sessionId?
+```
+
+Empty array (not exception, not null) when the search had no
+attributed clicks — the common case, since most searches don't
+get clicked. Cheaper than `getClickAttribution()` when the caller
+already knows the specific search row to expand.
+
+Requires engine 0.7.10 or newer; older engines 404 here.
+
+### New public types
+
+- `Lexis\TopQuery` — readonly properties `query`, `searches`,
+  `uniqueSearches`, `zeroResultSearches`, `avgLatencyMs`,
+  `lastSeenMs`. `fromArray()` factory mirrors the existing
+  `ClickAttribution::fromArray()` pattern (snake_case →
+  camelCase, sane defaults on missing fields).
+- `Lexis\Click` — readonly properties `id`, `orgId`, `indexSlug`,
+  `qid`, `productId`, `position` (nullable), `landingUrl`
+  (nullable), `apiKeyId` (nullable), `createdAtMs`, `sessionId`
+  (nullable). `fromArray()` factory same shape.
+
+### Tests
+
+5 new test cases covering: typed decode of `getTopQueries`,
+legacy-engine fallback for `unique_searches`, full decode of
+`getClicksForEvent` (both populated and null fields), empty-clicks
+case, and URL-safe encoding of unusual qid shapes. Suite stays
+at 100% pass — 41 → 46 cases, 165 → 191 assertions.
+
 ## v0.3.1 — variant catalog sync docs in README
 
 The README that Packagist surfaces (and that every developer reads
